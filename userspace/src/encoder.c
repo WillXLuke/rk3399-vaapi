@@ -23,6 +23,29 @@
 
 #include "encoder.h"
 
+#include <unistd.h>
+#include <stdio.h>
+
+/* File-gated diagnostics: touch /tmp/libva-enc-debug to enable. */
+static FILE *enc_debug_file(void)
+{
+	static FILE *f;
+	static bool checked;
+
+	if (!checked) {
+		checked = true;
+		if (access("/tmp/libva-enc-debug", F_OK) == 0)
+			f = fopen("/tmp/libva-enc-debug.log", "a");
+	}
+	return f;
+}
+
+#define ENCDBG(...) do { \
+	FILE *dbgf = enc_debug_file(); \
+	if (dbgf) { fprintf(dbgf, __VA_ARGS__); fflush(dbgf); } \
+} while (0)
+
+
 #include "buffer.h"
 #include "config.h"
 #include "context.h"
@@ -37,6 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -205,6 +229,35 @@ static bool encoder_profile_has_high_syntax(VAProfile profile)
  *   sequence buffer (ffmpeg fills the crop from the *display* width, which
  *   we can't reconstruct from the MB count alone).
  */
+/*
+ * Smallest H.264 level whose frame-size and macroblock-rate limits fit this
+ * stream.  ffmpeg's level hint is often too low for the actual frame rate
+ * (e.g. 1600x900@60 was declared level 4.0, which caps out at ~30 fps for
+ * that size), and hardware decoders do enforce these limits.
+ */
+static unsigned int encoder_h264_level(unsigned int mb_width,
+				       unsigned int mb_height,
+				       unsigned int fps)
+{
+	static const struct { unsigned int idc, max_fs, max_mbps; } levels[] = {
+		{ 10, 99, 1485 },     { 11, 396, 3000 },    { 12, 396, 6000 },
+		{ 13, 396, 11880 },   { 20, 396, 11880 },   { 21, 792, 19800 },
+		{ 22, 1620, 20250 },  { 30, 1620, 40500 },  { 31, 3600, 108000 },
+		{ 32, 5120, 216000 }, { 40, 8192, 245760 }, { 41, 8192, 245760 },
+		{ 42, 8704, 522240 }, { 50, 22080, 589824 }, { 51, 36864, 983040 },
+		{ 52, 36864, 2073600 }, { 60, 139264, 4177920 },
+	};
+	unsigned int fs = mb_width * mb_height;
+	unsigned int mbps = fs * (fps ? fps : 30);
+	unsigned int i;
+
+	for (i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+		if (levels[i].max_fs >= fs && levels[i].max_mbps >= mbps)
+			return levels[i].idc;
+	}
+	return 62;
+}
+
 static unsigned int encoder_build_sps(struct encoder_context *ec, uint8_t *out,
 				      unsigned int out_size)
 {
@@ -226,16 +279,27 @@ static unsigned int encoder_build_sps(struct encoder_context *ec, uint8_t *out,
 	bw_put_bits(&bw, 7, 5);
 
 	bw_put_bits(&bw, profile_idc, 8);
-	/* constraint_set0|1 + reserved_zero_2bits: 0xc0, same as the
-	 * known-good Bootlin reference stream (67 64 c0 1f ...). */
-	bw_put_bits(&bw, 1, 1);
-	bw_put_bits(&bw, 1, 1);
+	/*
+	 * Constraint flags: Baseline/Constrained Baseline set
+	 * constraint_set0, Main additionally constraint_set1.  High profile
+	 * streams leave them clear.
+	 */
+	bw_put_bits(&bw, profile_idc == 100 ? 0 : 1, 1);
+	bw_put_bits(&bw, profile_idc == 100 ? 0 :
+		    (ec->profile != VAProfileH264ConstrainedBaseline), 1);
 	bw_put_bits(&bw, 0, 1);
 	bw_put_bits(&bw, 0, 1);
 	bw_put_bits(&bw, 0, 1);
 	bw_put_bits(&bw, 0, 1);
 	bw_put_bits(&bw, 0, 2);
-	bw_put_bits(&bw, seq->level_idc ? seq->level_idc : 31, 8);
+	{
+		unsigned int level = encoder_h264_level(mb_width, mb_height,
+						       ec->rc_fps);
+
+		if (seq->level_idc > level)
+			level = seq->level_idc;
+		bw_put_bits(&bw, level, 8);
+	}
 	bw_put_ue(&bw, seq->seq_parameter_set_id);
 
 	if (encoder_profile_has_high_syntax(ec->profile) || profile_idc >= 100) {
@@ -265,7 +329,21 @@ static unsigned int encoder_build_sps(struct encoder_context *ec, uint8_t *out,
 		bw_put_ue(&bw, seq->frame_crop_bottom_offset);
 	}
 
-	bw_put_bits(&bw, 0, 1);	/* vui_parameters_present_flag */
+	/* VUI: timing only.  Hardware decoders and browser pipelines use it
+	 * to derive the display frame rate. */
+	bw_put_bits(&bw, 1, 1);	/* vui_parameters_present_flag */
+	bw_put_bits(&bw, 0, 1);	/* aspect_ratio_info_present_flag */
+	bw_put_bits(&bw, 0, 1);	/* overscan_info_present_flag */
+	bw_put_bits(&bw, 0, 1);	/* video_signal_type_present_flag */
+	bw_put_bits(&bw, 0, 1);	/* chroma_loc_info_present_flag */
+	bw_put_bits(&bw, 1, 1);	/* timing_info_present_flag */
+	bw_put_bits(&bw, 1, 32);	/* num_units_in_tick */
+	bw_put_bits(&bw, 2 * (ec->rc_fps ? ec->rc_fps : 30), 32); /* time_scale */
+	bw_put_bits(&bw, 1, 1);	/* fixed_frame_rate_flag */
+	bw_put_bits(&bw, 0, 1);	/* nal_hrd_parameters_present_flag */
+	bw_put_bits(&bw, 0, 1);	/* vcl_hrd_parameters_present_flag */
+	bw_put_bits(&bw, 0, 1);	/* pic_struct_present_flag */
+	bw_put_bits(&bw, 0, 1);	/* bitstream_restriction_flag */
 
 	len = bw_finish(&bw);
 
@@ -864,6 +942,10 @@ int encoder_surface_put_image_rect(struct object_surface *surface_object,
 					  false, src_x, src_y, dst_x, dst_y,
 					  width, height);
 
+	ENCDBG("put  surface=%u rect=%d,%d %ux%u img=%ux%u pitch=%u ret=%d\n",
+	       (unsigned)surface_object->base.id, dst_x, dst_y, width, height,
+	       image->width, image->height, image->pitches[0], ret);
+
 	return ret;
 }
 
@@ -1100,10 +1182,17 @@ VAStatus encoder_render_picture(struct request_data *driver_data,
 			BUFFER(driver_data, buffer_ids[i]);
 		VAStatus status;
 
-		if (buffer_object == NULL)
+		if (buffer_object == NULL) {
+			ENCDBG("render: null buffer id=%u\n",
+			       (unsigned)buffer_ids[i]);
 			return VA_STATUS_ERROR_INVALID_BUFFER;
+		}
 
 		status = encoder_store_buffer(ec, buffer_object);
+		if (status != VA_STATUS_SUCCESS)
+			ENCDBG("render: store failed type=%u size=%u status=%d\n",
+			       (unsigned)buffer_object->type,
+			       buffer_object->size, (int)status);
 		if (status != VA_STATUS_SUCCESS)
 			return status;
 	}
@@ -1269,6 +1358,11 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
+	ENCDBG("begin ctx=%p frame=%llu surface=%u enc=%dx%d data=%p pitch=%u\n",
+	       (void *)ec, ec->frame_count, (unsigned)surface_object->base.id,
+	       surface_object->enc_width, surface_object->enc_height,
+	       surface_object->enc_data, surface_object->enc_pitch);
+
 	/*
 	 * ffmpeg only submits VAEncSequenceParameterBufferType on IDR
 	 * pictures, so a P picture legitimately has no sequence buffer.
@@ -1426,6 +1520,28 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 
 	/* 6. Assemble the access unit in the VA coded buffer. */
 	payload_size = capture_bytesused[0];
+
+	ENCDBG("end  frame=%llu surface=%u idr=%d slice=%u qp=%u payload=%u\n",
+	       ec->frame_count, (unsigned)surface_object->base.id,
+	       ec->pic.pic_fields.bits.idr_pic_flag,
+	       (unsigned)ec->slice.slice_type, ec->rc.qp, payload_size);
+
+	if (enc_debug_file() && ec->frame_count < 3) {
+		char path[64];
+		FILE *au;
+		unsigned int yy;
+
+		snprintf(path, sizeof(path), "/tmp/enc-au-%llu.h264",
+			 ec->frame_count);
+		au = fopen(path, "wb");
+		if (au) {
+			fwrite(sps, 1, sps_size, au);
+			fwrite(pps, 1, pps_size, au);
+			for (yy = 0; yy < payload_size; yy++)
+				fwrite(capture->map[0] + yy, 1, 1, au);
+			fclose(au);
+		}
+	}
 
 	/* CBR/VBR: adapt the QP towards the per-frame bit budget. */
 	if (ec->rc_active && payload_size > 0) {

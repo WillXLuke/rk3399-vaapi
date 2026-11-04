@@ -235,3 +235,22 @@ the chroma plane copies full-width rows. Verified with
 the encoder, and the KasmVNC-style partial-update pattern no longer produces
 green regions. ffmpeg full-frame paths (Baseline/Main/High) still measure
 45+ dB.
+
+## Update: H.264 level / VUI conformance
+
+KasmVNC's web client configures WebCodecs for `avc1.64001F` and decodes the
+server's Annex-B stream with a hardware decoder where available. Our SPS
+declared **level 4.0 for a 1600x900@60** stream — 1600x900 is 5700 macroblocks
+per frame and 60 fps needs 342000 MB/s, while level 4.0 allows only 245760 —
+and carried no VUI. Hardware decoders enforce those limits, so they rejected
+the stream (green canvas) while file decoders in ffmpeg were lenient.
+
+The SPS writer now:
+* computes the smallest conformant level from frame size and frame rate
+  (4.2 for 1600x900@60, 4.2 for 1080p60) and only ever raises ffmpeg's hint;
+* emits a VUI with timing info (`num_units_in_tick=1`,
+  `time_scale=2*fps`, `fixed_frame_rate_flag=1`);
+* clears the constraint flags for High profile (Baseline/Main still set
+  constraint_set0/1).
+
+Regression: 720p Constrained Baseline/Main/High still 45.4 dB, decode unchanged.
