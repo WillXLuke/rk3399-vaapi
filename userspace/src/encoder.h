@@ -123,6 +123,14 @@ int encoder_surface_put_image(struct object_surface *surface_object,
 			      VAImage *image, void *image_data);
 int encoder_surface_get_image(struct object_surface *surface_object,
 			      VAImage *image, void *image_data);
+int encoder_surface_put_image_rect(struct object_surface *surface_object,
+				   VAImage *image, void *image_data,
+				   int src_x, int src_y, int dst_x, int dst_y,
+				   unsigned int width, unsigned int height);
+int encoder_surface_get_image_rect(struct object_surface *surface_object,
+				   VAImage *image, void *image_data,
+				   int src_x, int src_y, int dst_x, int dst_y,
+				   unsigned int width, unsigned int height);
 VAStatus encoder_derive_image(VADriverContextP context,
 			      struct object_surface *surface_object,
 			      VAImage *image);

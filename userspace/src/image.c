@@ -559,8 +559,8 @@ VAStatus RequestGetImage(VADriverContextP context, VASurfaceID surface_id,
 		return VA_STATUS_ERROR_INVALID_IMAGE;
 
 	image = &image_object->image;
-	if (x != 0 || y != 0 || width != image->width || height != image->height)
-		return VA_STATUS_ERROR_UNIMPLEMENTED;
+	if (width == 0 || height == 0)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
 	if (driver_data->encode_active &&
 	    surface_object->current_slot == NULL) {
@@ -572,8 +572,10 @@ VAStatus RequestGetImage(VADriverContextP context, VASurfaceID surface_id,
 		if (encoder_surface_ensure_storage(surface_object) < 0)
 			return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-		return encoder_surface_get_image(surface_object, image,
-						 buffer_object->data) < 0 ?
+		return encoder_surface_get_image_rect(surface_object, image,
+						      buffer_object->data,
+						      x, y, 0, 0, width,
+						      height) < 0 ?
 			VA_STATUS_ERROR_OPERATION_FAILED : VA_STATUS_SUCCESS;
 	}
 
@@ -619,10 +621,13 @@ VAStatus RequestPutImage(VADriverContextP context, VASurfaceID surface_id,
 	if (buffer_object == NULL)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
-	if (src_x != 0 || src_y != 0 ||
-	    src_width != va_image->width || src_height != va_image->height ||
-	    dst_x != 0 || dst_y != 0 ||
-	    dst_width != va_image->width || dst_height != va_image->height)
+	/*
+	 * Partial uploads are supported: compositors such as KasmVNC upload
+	 * only damaged rectangles and rely on the rest of the surface
+	 * persisting between frames.  Scaling is not supported, so the
+	 * source and destination rectangles must have the same size.
+	 */
+	if (src_width != dst_width || src_height != dst_height)
 		return VA_STATUS_ERROR_UNIMPLEMENTED;
 
 	if (va_image->format.fourcc != VA_FOURCC_NV12)
@@ -636,8 +641,10 @@ VAStatus RequestPutImage(VADriverContextP context, VASurfaceID surface_id,
 		    surface_object->width, surface_object->height,
 		    va_image->width, va_image->height);
 
-	if (encoder_surface_put_image(surface_object, va_image,
-				      buffer_object->data) < 0)
+	if (encoder_surface_put_image_rect(surface_object, va_image,
+					   buffer_object->data,
+					   src_x, src_y, dst_x, dst_y,
+					   dst_width, dst_height) < 0)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	surface_object->status = VASurfaceReady;

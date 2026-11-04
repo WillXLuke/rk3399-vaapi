@@ -210,3 +210,28 @@ Measured after the fixes (10 s, 300 frames, testsrc2):
 | 1920x1080 | High, CBR 4000 kbps | 4089 kbps, decodes |
 
 Run `tests/encode-matrix.sh` to reproduce.
+
+## Update: partial (damage-rectangle) uploads — KasmVNC green screen
+
+Symptom: with KasmVNC the first frame was fully green and only dragged
+rectangles showed content. KasmVNC uploads the first frame in full and then
+only damaged rectangles with `vaPutImage()`, relying on the surface keeping
+the rest of its contents.
+
+Two bugs in the VA backend:
+
+1. `vaPutImage()` returned `VA_STATUS_ERROR_UNIMPLEMENTED` for any rectangle
+   that was not the whole image, so damage updates were dropped.
+2. The new rectangle copier treated the NV12 chroma row as `width/2` bytes.
+   A chroma row is `width` bytes (interleaved U/V, one pair per two luma
+   samples); only the *vertical* geometry is halved. The truncated copy left
+   the right half of every chroma row zero, which renders exactly as a green
+   area while luma looks correct — the KasmVNC symptom.
+
+Both fixed: `vaPutImage()`/`vaGetImage()` accept rectangles (no scaling), and
+the chroma plane copies full-width rows. Verified with
+`tests/tools/enc_damage_test.c` (full first frame, then 64x64 damage rects for
+59 frames): all 60 frames decode at 42-45 dB against the exact frames fed to
+the encoder, and the KasmVNC-style partial-update pattern no longer produces
+green regions. ffmpeg full-frame paths (Baseline/Main/High) still measure
+45+ dB.

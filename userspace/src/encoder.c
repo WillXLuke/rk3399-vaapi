@@ -745,52 +745,102 @@ void encoder_surface_free_storage(struct object_surface *surface_object)
 	surface_object->enc_height = 0;
 }
 
-/* Copy a VAImage (NV12) laid out with `src_pitch`/`src_offsets` into the
- * surface's NV12 storage (or the reverse when `to_image` is set). */
-static int encoder_image_copy(struct object_surface *surface_object,
-			      VAImage *image, void *image_data, bool to_image)
+/*
+ * Copy a rectangle between an NV12 VAImage and the surface's NV12 storage.
+ *
+ * Coordinates are in pixels; the source and destination rectangles must
+ * have the same size (no scaling).  Chroma is handled at half resolution,
+ * so chroma coordinates are rounded down to even values.  This is the path
+ * used by compositors (e.g. KasmVNC) that upload only damaged rectangles.
+ */
+static int encoder_image_copy_rect(struct object_surface *surface_object,
+				   VAImage *image, void *image_data,
+				   bool to_image,
+				   int src_x, int src_y,
+				   int dst_x, int dst_y,
+				   unsigned int width, unsigned int height)
 {
-	unsigned int plane, rows, bytes;
-	unsigned int width = surface_object->enc_width;
-	unsigned int height = surface_object->enc_height;
+	unsigned int surface_width = surface_object->enc_width;
+	unsigned int surface_height = surface_object->enc_height;
+	unsigned int surface_pitch = surface_object->enc_pitch;
 	uint8_t *surface_data = surface_object->enc_data;
+	unsigned int plane;
 
-	if (image->format.fourcc != VA_FOURCC_NV12)
+	if (image->format.fourcc != VA_FOURCC_NV12 || image->num_planes < 2)
 		return -1;
-	if (image->num_planes < 2)
-		return -1;
+	if (width == 0 || height == 0)
+		return 0;
 
 	for (plane = 0; plane < 2; plane++) {
-		unsigned int plane_height = plane == 0 ? height : height / 2;
-		unsigned int surface_offset = plane == 0 ? 0 :
-			surface_object->enc_pitch * height;
+		unsigned int plane_width, plane_height, sx, sy, dx, dy;
+		unsigned int image_pitch = image->pitches[plane];
+		unsigned int surface_plane_offset = plane == 0 ? 0 :
+			surface_pitch * surface_height;
 		uint8_t *image_plane = (uint8_t *)image_data +
 				       image->offsets[plane];
-		uint8_t *surface_plane = surface_data + surface_offset;
+		uint8_t *surface_plane = surface_data + surface_plane_offset;
+		unsigned int y;
 
-		rows = plane_height;
-		bytes = width;
+		if (plane == 0) {
+			plane_width = width;
+			plane_height = height;
+			sx = (unsigned int)src_x;
+			sy = (unsigned int)src_y;
+			dx = (unsigned int)dst_x;
+			dy = (unsigned int)dst_y;
+		} else {
+			/*
+			 * NV12 chroma is interleaved U/V and half resolution,
+			 * but one chroma row is still `width` bytes long (one
+			 * U/V pair per two luma samples).  Only the vertical
+			 * geometry is halved.
+			 */
+			plane_width = width & ~1U;
+			plane_height = height / 2;
+			sx = (unsigned int)src_x & ~1U;
+			sy = (unsigned int)src_y / 2;
+			dx = (unsigned int)dst_x & ~1U;
+			dy = (unsigned int)dst_y / 2;
+		}
 
-		if (image->width < width)
-			bytes = image->width;
-		if (image->height < height && plane == 0)
-			rows = image->height;
-		if (image->height / 2 < plane_height && plane == 1)
-			rows = image->height / 2;
+		/* Clip to the surface. */
+		if (dx >= surface_width || dy >= surface_height / (plane + 1))
+			continue;
+		if (dx + plane_width > surface_width)
+			plane_width = surface_width - dx;
+		if (dy + plane_height > surface_height / (plane + 1))
+			plane_height = surface_height / (plane + 1) - dy;
+		/* Clip to the source image. */
+		if (sx + plane_width > image->width)
+			plane_width = image->width - sx;
+		if (sy + plane_height > image->height / (plane + 1))
+			plane_height = image->height / (plane + 1) - sy;
+		if (plane_width == 0 || plane_height == 0)
+			continue;
 
-		for (unsigned int y = 0; y < rows; y++) {
+		for (y = 0; y < plane_height; y++) {
+			uint8_t *sp = surface_plane +
+				      (size_t)(dy + y) * surface_pitch + dx;
+			uint8_t *ip = image_plane +
+				      (size_t)(sy + y) * image_pitch + sx;
+
 			if (to_image)
-				memcpy(image_plane + (size_t)y * image->pitches[plane],
-				       surface_plane + (size_t)y * surface_object->enc_pitch,
-				       bytes);
+				memcpy(ip, sp, plane_width);
 			else
-				memcpy(surface_plane + (size_t)y * surface_object->enc_pitch,
-				       image_plane + (size_t)y * image->pitches[plane],
-				       bytes);
+				memcpy(sp, ip, plane_width);
 		}
 	}
 
 	return 0;
+}
+
+static int encoder_image_copy(struct object_surface *surface_object,
+			      VAImage *image, void *image_data, bool to_image)
+{
+	return encoder_image_copy_rect(surface_object, image, image_data,
+				       to_image, 0, 0, 0, 0,
+				       surface_object->enc_width,
+				       surface_object->enc_height);
 }
 
 int encoder_surface_put_image(struct object_surface *surface_object,
@@ -803,6 +853,28 @@ int encoder_surface_get_image(struct object_surface *surface_object,
 			      VAImage *image, void *image_data)
 {
 	return encoder_image_copy(surface_object, image, image_data, true);
+}
+
+int encoder_surface_put_image_rect(struct object_surface *surface_object,
+				   VAImage *image, void *image_data,
+				   int src_x, int src_y, int dst_x, int dst_y,
+				   unsigned int width, unsigned int height)
+{
+	int ret = encoder_image_copy_rect(surface_object, image, image_data,
+					  false, src_x, src_y, dst_x, dst_y,
+					  width, height);
+
+	return ret;
+}
+
+int encoder_surface_get_image_rect(struct object_surface *surface_object,
+				   VAImage *image, void *image_data,
+				   int src_x, int src_y, int dst_x, int dst_y,
+				   unsigned int width, unsigned int height)
+{
+	return encoder_image_copy_rect(surface_object, image, image_data, true,
+				       src_x, src_y, dst_x, dst_y,
+				       width, height);
 }
 
 /* ------------------------------------------------------------------------
@@ -1162,6 +1234,7 @@ static int encoder_copy_surface(struct encoder_context *ec,
 			memcpy(dst + (size_t)y * dst_pitch,
 			       src + (size_t)y * surface_object->enc_pitch,
 			       bytes);
+
 	}
 
 	return 0;
