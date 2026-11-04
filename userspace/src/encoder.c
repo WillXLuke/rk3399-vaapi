@@ -1,0 +1,1342 @@
+/*
+ * VA-API H.264 encoder frontend for the Rockchip RK3399 VEPU2 (hantro).
+ *
+ * This maps VAEntrypointEncSlice onto the V4L2 stateless H.264 encode UAPI
+ * (`V4L2_CID_STATELESS_H264_ENCODE_PARAMS` / `_RC`) implemented by the
+ * hantro-vpu driver for the `rockchip,rk3399-vpu-enc` instance.
+ *
+ * Hardware constraints that shape this frontend (verified against the
+ * Bootlin reference tool, see kernel/hantro-enc/VA-FRONTEND-VERIFIED.md):
+ *
+ *   - The hardware emits only the slice NAL.  SPS and PPS are written by
+ *     userspace, so PackedHeaders is advertised as 0 and we serialise
+ *     SPS+PPS ourselves on IDR pictures.
+ *   - VEPU2 writes a 16-bit frame_num and no pic_order_cnt_lsb, hence the
+ *     SPS must use log2_max_frame_num_minus4 = 12 and
+ *     pic_order_cnt_type = 2 regardless of what the application asks for.
+ *   - A P picture's reference is located by the kernel with
+ *     vb2_find_buffer() on the CAPTURE queue using the ENCODE_PARAMS
+ *     reference_ts; that is the timestamp the peer CAPTURE buffer inherited
+ *     from the previous OUTPUT queueing (TIMESTAMP_COPY).
+ *   - Exactly one reference frame, no B frames, CQP only.
+ */
+
+#include "encoder.h"
+
+#include "buffer.h"
+#include "config.h"
+#include "context.h"
+#include "image.h"
+#include "request.h"
+#include "surface.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+
+#include <linux/media.h>
+#include <linux/videodev2.h>
+
+#include "media.h"
+#include "utils.h"
+#include "v4l2.h"
+
+/* Number of mmap'd buffers per queue (Bootlin reference uses 3; we keep a
+ * little more headroom so a consumer can hold an input surface across
+ * frames without starving the OUTPUT rotation). */
+#define ENCODER_OUTPUT_BUFFERS		4
+#define ENCODER_CAPTURE_BUFFERS		4
+
+/* CAPTURE sizeimage: the encoder writes one slice NAL per frame.  1 MiB is
+ * comfortably above 1080p worst case and matches what the driver defaults
+ * to for 640x480 (w*h*2). */
+#define ENCODER_CAPTURE_SIZEIMAGE	(1024 * 1024)
+
+/* ------------------------------------------------------------------------
+ * Bit writer (RBSP) + Annex-B NAL packing
+ * --------------------------------------------------------------------- */
+
+struct encoder_bitwriter {
+	uint8_t *data;
+	unsigned int capacity;
+	unsigned int bit_offset;
+};
+
+static void bw_init(struct encoder_bitwriter *bw, uint8_t *data,
+		    unsigned int capacity)
+{
+	bw->data = data;
+	bw->capacity = capacity;
+	bw->bit_offset = 0;
+	memset(data, 0, capacity);
+}
+
+static void bw_put_bits(struct encoder_bitwriter *bw, uint32_t value,
+			unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		unsigned int bit = (value >> (count - 1 - i)) & 1;
+		unsigned int byte = bw->bit_offset >> 3;
+		unsigned int shift = 7 - (bw->bit_offset & 7);
+
+		if (byte >= bw->capacity)
+			return;
+		bw->data[byte] |= bit << shift;
+		bw->bit_offset++;
+	}
+}
+
+static void bw_put_ue(struct encoder_bitwriter *bw, uint32_t value)
+{
+	unsigned int bits = 0;
+	uint32_t v = value + 1;
+
+	while ((v >> bits) > 1)
+		bits++;
+
+	bw_put_bits(bw, 0, bits);
+	bw_put_bits(bw, v, bits + 1);
+}
+
+static void bw_put_se(struct encoder_bitwriter *bw, int32_t value)
+{
+	uint32_t mapped = value > 0 ? (uint32_t)(2 * value - 1)
+				    : (uint32_t)(-2 * value);
+
+	bw_put_ue(bw, mapped);
+}
+
+/* rbsp_stop_one_bit followed by zero-bit alignment to a byte boundary. */
+static unsigned int bw_finish(struct encoder_bitwriter *bw)
+{
+	bw_put_bits(bw, 1, 1);
+	while (bw->bit_offset & 7)
+		bw_put_bits(bw, 0, 1);
+
+	return (bw->bit_offset + 7) / 8;
+}
+
+/*
+ * Wrap `rbsp` in an Annex-B NAL unit: 4-byte start code, then the bytes
+ * with emulation prevention applied (0x03 inserted after 00 00 followed by
+ * a byte <= 0x03).  Returns the number of bytes written, 0 on overflow.
+ */
+static unsigned int nal_pack(uint8_t *out, unsigned int out_size,
+			     const uint8_t *rbsp, unsigned int rbsp_size)
+{
+	unsigned int i, o = 0;
+	unsigned int zeros = 0;
+
+	if (out_size < 4)
+		return 0;
+
+	out[o++] = 0x00;
+	out[o++] = 0x00;
+	out[o++] = 0x00;
+	out[o++] = 0x01;
+
+	for (i = 0; i < rbsp_size; i++) {
+		uint8_t byte = rbsp[i];
+
+		if (zeros >= 2 && byte <= 0x03) {
+			if (o + 1 >= out_size)
+				return 0;
+			out[o++] = 0x03;
+			zeros = 0;
+		}
+		if (o >= out_size)
+			return 0;
+		out[o++] = byte;
+
+		if (byte == 0x00)
+			zeros++;
+		else
+			zeros = 0;
+	}
+
+	/* Never let the last emitted byte be a zero: it could be absorbed by
+	 * the following start code's leading zero bytes. */
+	if (o > 0 && out[o - 1] == 0x00) {
+		if (o >= out_size)
+			return 0;
+		out[o++] = 0x03;
+	}
+
+	return o;
+}
+
+/* ------------------------------------------------------------------------
+ * SPS / PPS serialisation
+ * --------------------------------------------------------------------- */
+
+static unsigned int encoder_profile_idc(VAProfile profile)
+{
+	switch (profile) {
+	case VAProfileH264ConstrainedBaseline:
+		return 66;
+	case VAProfileH264Main:
+		return 77;
+	case VAProfileH264High:
+		return 100;
+	default:
+		return 100;
+	}
+}
+
+static bool encoder_profile_has_high_syntax(VAProfile profile)
+{
+	return profile == VAProfileH264High;
+}
+
+/*
+ * SPS.  Deliberately mirrors the reference stream layout:
+ *   profile High, constraint_set0|1, level from the VA sequence buffer,
+ *   pic_order_cnt_type = 2, log2_max_frame_num_minus4 = 12, one reference,
+ *   frame_mbs_only, direct_8x8_inference, cropping straight from the VA
+ *   sequence buffer (ffmpeg fills the crop from the *display* width, which
+ *   we can't reconstruct from the MB count alone).
+ */
+static unsigned int encoder_build_sps(struct encoder_context *ec, uint8_t *out,
+				      unsigned int out_size)
+{
+	const VAEncSequenceParameterBufferH264 *seq = &ec->seq;
+	unsigned int profile_idc = encoder_profile_idc(ec->profile);
+	unsigned int mb_width = seq->picture_width_in_mbs ?
+				seq->picture_width_in_mbs : ec->mb_width;
+	unsigned int mb_height = seq->picture_height_in_mbs ?
+				 seq->picture_height_in_mbs : ec->mb_height;
+	uint8_t rbsp[256];
+	struct encoder_bitwriter bw;
+	unsigned int len;
+
+	bw_init(&bw, rbsp, sizeof(rbsp));
+
+	/* NAL header: nal_ref_idc = 3, nal_unit_type = 7 (SPS). */
+	bw_put_bits(&bw, 0, 1);
+	bw_put_bits(&bw, 3, 2);
+	bw_put_bits(&bw, 7, 5);
+
+	bw_put_bits(&bw, profile_idc, 8);
+	/* constraint_set0|1 + reserved_zero_2bits: 0xc0, same as the
+	 * known-good Bootlin reference stream (67 64 c0 1f ...). */
+	bw_put_bits(&bw, 1, 1);
+	bw_put_bits(&bw, 1, 1);
+	bw_put_bits(&bw, 0, 1);
+	bw_put_bits(&bw, 0, 1);
+	bw_put_bits(&bw, 0, 1);
+	bw_put_bits(&bw, 0, 1);
+	bw_put_bits(&bw, 0, 2);
+	bw_put_bits(&bw, seq->level_idc ? seq->level_idc : 31, 8);
+	bw_put_ue(&bw, seq->seq_parameter_set_id);
+
+	if (encoder_profile_has_high_syntax(ec->profile) || profile_idc >= 100) {
+		bw_put_ue(&bw, 1);	/* chroma_format_idc = 4:2:0 */
+		bw_put_ue(&bw, 0);	/* bit_depth_luma_minus8 */
+		bw_put_ue(&bw, 0);	/* bit_depth_chroma_minus8 */
+		bw_put_bits(&bw, 0, 1);	/* qpprime_y_zero_transform_bypass */
+		bw_put_bits(&bw, 0, 1);	/* seq_scaling_matrix_present */
+	}
+
+	/* Mandatory for VEPU2: 16-bit frame_num, no POC LSB. */
+	bw_put_ue(&bw, 12);	/* log2_max_frame_num_minus4 */
+	bw_put_ue(&bw, 2);	/* pic_order_cnt_type */
+
+	bw_put_ue(&bw, 1);	/* max_num_ref_frames = 1 */
+	bw_put_bits(&bw, 0, 1);	/* gaps_in_frame_num_value_allowed_flag */
+	bw_put_ue(&bw, mb_width - 1);
+	bw_put_ue(&bw, mb_height - 1);
+	bw_put_bits(&bw, 1, 1);	/* frame_mbs_only_flag */
+	bw_put_bits(&bw, 1, 1);	/* direct_8x8_inference_flag */
+
+	bw_put_bits(&bw, seq->frame_cropping_flag ? 1 : 0, 1);
+	if (seq->frame_cropping_flag) {
+		bw_put_ue(&bw, seq->frame_crop_left_offset);
+		bw_put_ue(&bw, seq->frame_crop_right_offset);
+		bw_put_ue(&bw, seq->frame_crop_top_offset);
+		bw_put_ue(&bw, seq->frame_crop_bottom_offset);
+	}
+
+	bw_put_bits(&bw, 0, 1);	/* vui_parameters_present_flag */
+
+	len = bw_finish(&bw);
+
+	return nal_pack(out, out_size, rbsp, len);
+}
+
+/*
+ * PPS.  deblocking_filter_control_present_flag = 1 and CABAC are fixed by
+ * the hardware (it writes the slice header and expects the matching PPS).
+ * For High profile ffmpeg enables transform_8x8_mode, which adds the
+ * more_rbsp_data() PPS tail; Baseline/Main must not carry it.
+ */
+static unsigned int encoder_build_pps(struct encoder_context *ec, uint8_t *out,
+				      unsigned int out_size)
+{
+	const VAEncPictureParameterBufferH264 *pic = &ec->pic;
+	bool high = encoder_profile_has_high_syntax(ec->profile);
+	bool cabac = !!pic->pic_fields.bits.entropy_coding_mode_flag;
+	bool transform_8x8 = high && !!pic->pic_fields.bits.transform_8x8_mode_flag;
+	uint8_t rbsp[256];
+	struct encoder_bitwriter bw;
+	unsigned int len;
+
+	if (!high)
+		cabac = false;
+
+	bw_init(&bw, rbsp, sizeof(rbsp));
+
+	/* NAL header: nal_ref_idc = 3, nal_unit_type = 8 (PPS). */
+	bw_put_bits(&bw, 0, 1);
+	bw_put_bits(&bw, 3, 2);
+	bw_put_bits(&bw, 8, 5);
+
+	bw_put_ue(&bw, 0);	/* pic_parameter_set_id */
+	bw_put_ue(&bw, 0);	/* seq_parameter_set_id */
+	bw_put_bits(&bw, cabac, 1);	/* entropy_coding_mode_flag */
+	bw_put_bits(&bw, 0, 1);	/* bottom_field_pic_order_in_frame_present */
+	bw_put_ue(&bw, 0);	/* num_slice_groups_minus1 */
+	bw_put_ue(&bw, pic->num_ref_idx_l0_active_minus1);
+	bw_put_ue(&bw, 0);	/* num_ref_idx_l1_default_active_minus1 */
+	bw_put_bits(&bw, pic->pic_fields.bits.weighted_pred_flag, 1);
+	bw_put_bits(&bw, 0, 2);	/* weighted_bipred_idc */
+	bw_put_se(&bw, (int8_t)pic->pic_init_qp - 26);	/* pic_init_qp_minus26 */
+	bw_put_se(&bw, 0);	/* pic_init_qs_minus26 */
+	bw_put_se(&bw, (int8_t)pic->chroma_qp_index_offset);
+	bw_put_bits(&bw, 1, 1);	/* deblocking_filter_control_present_flag */
+	bw_put_bits(&bw, pic->pic_fields.bits.constrained_intra_pred_flag, 1);
+	bw_put_bits(&bw, 0, 1);	/* redundant_pic_cnt_present_flag */
+
+	if (transform_8x8) {
+		bw_put_bits(&bw, 1, 1);	/* transform_8x8_mode_flag */
+		bw_put_bits(&bw, 0, 1);	/* pic_scaling_matrix_present_flag */
+		bw_put_se(&bw, (int8_t)pic->second_chroma_qp_index_offset);
+	}
+
+	len = bw_finish(&bw);
+
+	return nal_pack(out, out_size, rbsp, len);
+}
+
+/* ------------------------------------------------------------------------
+ * V4L2 device helpers
+ * --------------------------------------------------------------------- */
+
+/* S_FMT for a multiplanar queue.  sizeimage == 0 lets the driver pick. */
+static int encoder_set_format(int video_fd, unsigned int type,
+			      unsigned int pixelformat, unsigned int width,
+			      unsigned int height, unsigned int sizeimage)
+{
+	struct v4l2_format format;
+	int rc;
+
+	memset(&format, 0, sizeof(format));
+	format.type = type;
+	format.fmt.pix_mp.width = width;
+	format.fmt.pix_mp.height = height;
+	format.fmt.pix_mp.pixelformat = pixelformat;
+	format.fmt.pix_mp.plane_fmt[0].sizeimage = sizeimage;
+
+	rc = ioctl(video_fd, VIDIOC_S_FMT, &format);
+	if (rc < 0) {
+		request_log("encoder: S_FMT type %u fourcc %08x %ux%u failed: %s\n",
+			    type, pixelformat, width, height, strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+static void encoder_buffer_teardown(struct encoder_buffer *buffer)
+{
+	unsigned int i;
+
+	for (i = 0; i < buffer->planes_count; i++) {
+		if (buffer->map[i] != NULL && buffer->map[i] != MAP_FAILED)
+			munmap(buffer->map[i], buffer->lengths[i]);
+		buffer->map[i] = NULL;
+	}
+
+	if (buffer->request_fd >= 0)
+		close(buffer->request_fd);
+
+	buffer->request_fd = -1;
+	buffer->planes_count = 0;
+}
+
+static int encoder_buffer_setup(struct encoder_context *ec,
+				struct encoder_buffer *buffer,
+				unsigned int type, unsigned int index)
+{
+	struct v4l2_plane planes[ENCODER_MAX_PLANES];
+	struct v4l2_buffer buffer_v4l2;
+	unsigned int i;
+	int rc;
+
+	buffer->request_fd = -1;
+
+	memset(planes, 0, sizeof(planes));
+	memset(&buffer_v4l2, 0, sizeof(buffer_v4l2));
+
+	buffer_v4l2.type = type;
+	buffer_v4l2.memory = V4L2_MEMORY_MMAP;
+	buffer_v4l2.index = index;
+	buffer_v4l2.length = ENCODER_MAX_PLANES;
+	buffer_v4l2.m.planes = planes;
+
+	rc = ioctl(ec->video_fd, VIDIOC_QUERYBUF, &buffer_v4l2);
+	if (rc < 0) {
+		request_log("encoder: QUERYBUF type %u index %u failed: %s\n",
+			    type, index, strerror(errno));
+		return -1;
+	}
+
+	buffer->index = index;
+	buffer->planes_count = buffer_v4l2.length;
+
+	for (i = 0; i < buffer->planes_count; i++) {
+		buffer->lengths[i] = planes[i].length;
+		buffer->map[i] = mmap(NULL, planes[i].length,
+				      PROT_READ | PROT_WRITE, MAP_SHARED,
+				      ec->video_fd, planes[i].m.mem_offset);
+		if (buffer->map[i] == MAP_FAILED) {
+			request_log("encoder: mmap type %u index %u plane %u failed: %s\n",
+				    type, index, i, strerror(errno));
+			buffer->map[i] = NULL;
+			encoder_buffer_teardown(buffer);
+			return -1;
+		}
+	}
+
+	/*
+	 * One media request per OUTPUT buffer, reinitialised with
+	 * MEDIA_REQUEST_IOC_REINIT after each completed encode.
+	 */
+	buffer->request_fd = -1;
+	if (type == ec->output_type) {
+		buffer->request_fd = media_request_alloc(ec->media_fd);
+		if (buffer->request_fd < 0)
+			return -1;
+	}
+
+	buffer->timestamp = 0;
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Device probe
+ * --------------------------------------------------------------------- */
+
+static int encoder_media_device_for(const char *bus_info, char *media_out,
+				    size_t media_out_size)
+{
+	struct media_device_info info;
+	char path[32];
+	int fd, i;
+
+	for (i = 0; i < 16; i++) {
+		snprintf(path, sizeof(path), "/dev/media%d", i);
+		fd = open(path, O_RDWR | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+
+		memset(&info, 0, sizeof(info));
+		if (ioctl(fd, MEDIA_IOC_DEVICE_INFO, &info) == 0 &&
+		    strcmp(info.bus_info, bus_info) == 0) {
+			snprintf(media_out, media_out_size, "%s", path);
+			close(fd);
+			return 0;
+		}
+		close(fd);
+	}
+
+	return -1;
+}
+
+/*
+ * Auto-detect the VEPU2 encoder instance:
+ *   driver "hantro-vpu", card "rockchip,rk3399-vpu-enc" and
+ *   V4L2_PIX_FMT_H264_SLICE ('S264') among CAPTURE formats.
+ * Node numbering changes across module reloads, so scan /dev/video0..31.
+ */
+int encoder_device_probe(int *video_fd_out, int *media_fd_out)
+{
+	struct v4l2_capability capability;
+	char path[32];
+	int i;
+
+	*video_fd_out = -1;
+	*media_fd_out = -1;
+
+	for (i = 0; i < 32; i++) {
+		char media_path[32];
+		int fd, vfd, mfd;
+
+		snprintf(path, sizeof(path), "/dev/video%d", i);
+		fd = open(path, O_RDWR | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+
+		memset(&capability, 0, sizeof(capability));
+		if (ioctl(fd, VIDIOC_QUERYCAP, &capability) < 0 ||
+		    strcmp((const char *)capability.driver, "hantro-vpu") != 0 ||
+		    strstr((const char *)capability.card, "vpu-enc") == NULL ||
+		    !v4l2_find_format(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+				      V4L2_PIX_FMT_H264_SLICE)) {
+			close(fd);
+			continue;
+		}
+
+		/* The V4L2 node's bus_info selects the media device that
+		 * owns its request API (same platform device). */
+		if (encoder_media_device_for((const char *)capability.bus_info,
+					     media_path, sizeof(media_path)) < 0) {
+			request_log("encoder: no media device for %s (%s)\n",
+				    path, capability.bus_info);
+			close(fd);
+			return -1;
+		}
+
+		vfd = fd;
+		mfd = open(media_path, O_RDWR | O_NONBLOCK);
+		if (mfd < 0) {
+			request_log("encoder: open %s failed: %s\n", media_path,
+				    strerror(errno));
+			close(vfd);
+			continue;
+		}
+
+		request_log("encoder: using %s + %s (%s)\n", path, media_path,
+			    capability.card);
+		*video_fd_out = vfd;
+		*media_fd_out = mfd;
+		return 0;
+	}
+
+	return -1;
+}
+
+/* ------------------------------------------------------------------------
+ * Context lifecycle
+ * --------------------------------------------------------------------- */
+
+struct encoder_context *encoder_context_create(struct request_data *driver_data,
+					       VAProfile profile,
+					       unsigned int width,
+					       unsigned int height)
+{
+	struct encoder_context *ec;
+	struct v4l2_format format;
+	unsigned int i;
+	int rc;
+
+	ec = calloc(1, sizeof(*ec));
+	if (ec == NULL)
+		return NULL;
+
+	ec->video_fd = driver_data->video_fd_enc;
+	ec->media_fd = driver_data->media_fd_enc;
+	ec->profile = profile;
+	ec->width = width;
+	ec->height = height;
+	ec->mb_width = (width + 15) / 16;
+	ec->mb_height = (height + 15) / 16;
+	ec->output_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+	ec->capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	ec->coded_buf = VA_INVALID_ID;
+	ec->last_ts = 0;
+	ec->timestamp = 0;
+	ec->frame_count = 0;
+	for (i = 0; i < 8; i++) {
+		ec->output[i].request_fd = -1;
+		ec->capture[i].request_fd = -1;
+	}
+
+	if (ec->video_fd < 0 || ec->media_fd < 0) {
+		free(ec);
+		return NULL;
+	}
+
+	/*
+	 * Order matters: the coded (CAPTURE) format must be committed first,
+	 * because hantro_set_fmt_cap() resets the raw OUTPUT format to its
+	 * default when S_FMT is issued after it.  This matches the Bootlin
+	 * reference tool.
+	 */
+	rc = encoder_set_format(ec->video_fd, ec->capture_type,
+				V4L2_PIX_FMT_H264_SLICE, width, height,
+				ENCODER_CAPTURE_SIZEIMAGE);
+	if (rc < 0)
+		goto error;
+
+	rc = encoder_set_format(ec->video_fd, ec->output_type,
+				V4L2_PIX_FMT_NV12M, width, height, 0);
+	if (rc < 0)
+		goto error;
+
+	/* Read back the geometry the driver settled on. */
+	memset(&format, 0, sizeof(format));
+	format.type = ec->output_type;
+	if (ioctl(ec->video_fd, VIDIOC_G_FMT, &format) < 0) {
+		request_log("encoder: G_FMT OUTPUT failed: %s\n", strerror(errno));
+		goto error;
+	}
+
+	ec->output_planes_count = format.fmt.pix_mp.num_planes;
+	if (ec->output_planes_count > ENCODER_MAX_PLANES)
+		ec->output_planes_count = ENCODER_MAX_PLANES;
+
+	for (i = 0; i < ec->output_planes_count; i++) {
+		ec->output_bytesperlines[i] =
+			format.fmt.pix_mp.plane_fmt[i].bytesperline;
+		ec->output_sizes[i] = format.fmt.pix_mp.plane_fmt[i].sizeimage;
+	}
+	ec->output_width = format.fmt.pix_mp.width;
+	ec->output_height = format.fmt.pix_mp.height;
+
+	memset(&format, 0, sizeof(format));
+	format.type = ec->capture_type;
+	if (ioctl(ec->video_fd, VIDIOC_G_FMT, &format) < 0) {
+		request_log("encoder: G_FMT CAPTURE failed: %s\n", strerror(errno));
+		goto error;
+	}
+	ec->capture_sizeimage = format.fmt.pix_mp.plane_fmt[0].sizeimage;
+	ec->capture_width = format.fmt.pix_mp.width;
+	ec->capture_height = format.fmt.pix_mp.height;
+
+	request_log("encoder: %ux%u NV12M planes=%u bpl=%u/%u size=%u/%u, "
+		    "H264_SLICE sizeimage=%u\n",
+		    width, height, ec->output_planes_count,
+		    ec->output_bytesperlines[0], ec->output_bytesperlines[1],
+		    ec->output_sizes[0], ec->output_sizes[1],
+		    ec->capture_sizeimage);
+
+	/* CAPTURE buffers first: mplane coded queue, single plane. */
+	rc = v4l2_request_buffers(ec->video_fd, ec->capture_type,
+				  ENCODER_CAPTURE_BUFFERS);
+	if (rc < 0)
+		goto error;
+
+	for (i = 0; i < ENCODER_CAPTURE_BUFFERS; i++) {
+		rc = encoder_buffer_setup(ec, &ec->capture[i],
+					  ec->capture_type, i);
+		if (rc < 0)
+			goto error;
+	}
+	ec->capture_count = ENCODER_CAPTURE_BUFFERS;
+
+	rc = v4l2_request_buffers(ec->video_fd, ec->output_type,
+				  ENCODER_OUTPUT_BUFFERS);
+	if (rc < 0)
+		goto error;
+
+	for (i = 0; i < ENCODER_OUTPUT_BUFFERS; i++) {
+		rc = encoder_buffer_setup(ec, &ec->output[i], ec->output_type,
+					  i);
+		if (rc < 0)
+			goto error;
+	}
+	ec->output_count = ENCODER_OUTPUT_BUFFERS;
+
+	rc = v4l2_set_stream(ec->video_fd, ec->output_type, true);
+	if (rc < 0)
+		goto error;
+
+	rc = v4l2_set_stream(ec->video_fd, ec->capture_type, true);
+	if (rc < 0)
+		goto error;
+
+	ec->streaming = true;
+
+	return ec;
+
+error:
+	encoder_context_destroy(ec);
+	return NULL;
+}
+
+void encoder_context_destroy(struct encoder_context *ec)
+{
+	unsigned int i;
+
+	if (ec == NULL)
+		return;
+
+	if (ec->video_fd >= 0) {
+		if (ec->streaming) {
+			v4l2_set_stream(ec->video_fd, ec->output_type, false);
+			v4l2_set_stream(ec->video_fd, ec->capture_type, false);
+		}
+
+		for (i = 0; i < ec->output_count; i++)
+			encoder_buffer_teardown(&ec->output[i]);
+		for (i = 0; i < ec->capture_count; i++)
+			encoder_buffer_teardown(&ec->capture[i]);
+
+		v4l2_request_buffers(ec->video_fd, ec->output_type, 0);
+		v4l2_request_buffers(ec->video_fd, ec->capture_type, 0);
+	}
+
+	free(ec);
+}
+
+/* ------------------------------------------------------------------------
+ * Surface NV12 storage (encoder-owned)
+ * --------------------------------------------------------------------- */
+
+int encoder_surface_ensure_storage(struct object_surface *surface_object)
+{
+	unsigned int width = surface_object->width;
+	unsigned int height = surface_object->height;
+	unsigned int pitch, size;
+
+	if (surface_object->enc_data != NULL &&
+	    surface_object->enc_pitch == width &&
+	    surface_object->enc_width == width &&
+	    surface_object->enc_height == height)
+		return 0;
+
+	if (surface_object->enc_data != NULL) {
+		free(surface_object->enc_data);
+		surface_object->enc_data = NULL;
+	}
+
+	if (width == 0 || height == 0)
+		return -1;
+
+	pitch = width;
+	size = pitch * height * 3 / 2;
+
+	surface_object->enc_data = malloc(size);
+	if (surface_object->enc_data == NULL)
+		return -1;
+
+	memset(surface_object->enc_data, 0, size);
+	surface_object->enc_pitch = pitch;
+	surface_object->enc_width = width;
+	surface_object->enc_height = height;
+
+	return 0;
+}
+
+void encoder_surface_free_storage(struct object_surface *surface_object)
+{
+	if (surface_object->enc_data != NULL)
+		free(surface_object->enc_data);
+
+	surface_object->enc_data = NULL;
+	surface_object->enc_pitch = 0;
+	surface_object->enc_width = 0;
+	surface_object->enc_height = 0;
+}
+
+/* Copy a VAImage (NV12) laid out with `src_pitch`/`src_offsets` into the
+ * surface's NV12 storage (or the reverse when `to_image` is set). */
+static int encoder_image_copy(struct object_surface *surface_object,
+			      VAImage *image, void *image_data, bool to_image)
+{
+	unsigned int plane, rows, bytes;
+	unsigned int width = surface_object->enc_width;
+	unsigned int height = surface_object->enc_height;
+	uint8_t *surface_data = surface_object->enc_data;
+
+	if (image->format.fourcc != VA_FOURCC_NV12)
+		return -1;
+	if (image->num_planes < 2)
+		return -1;
+
+	for (plane = 0; plane < 2; plane++) {
+		unsigned int plane_height = plane == 0 ? height : height / 2;
+		unsigned int surface_offset = plane == 0 ? 0 :
+			surface_object->enc_pitch * height;
+		uint8_t *image_plane = (uint8_t *)image_data +
+				       image->offsets[plane];
+		uint8_t *surface_plane = surface_data + surface_offset;
+
+		rows = plane_height;
+		bytes = width;
+
+		if (image->width < width)
+			bytes = image->width;
+		if (image->height < height && plane == 0)
+			rows = image->height;
+		if (image->height / 2 < plane_height && plane == 1)
+			rows = image->height / 2;
+
+		for (unsigned int y = 0; y < rows; y++) {
+			if (to_image)
+				memcpy(image_plane + (size_t)y * image->pitches[plane],
+				       surface_plane + (size_t)y * surface_object->enc_pitch,
+				       bytes);
+			else
+				memcpy(surface_plane + (size_t)y * surface_object->enc_pitch,
+				       image_plane + (size_t)y * image->pitches[plane],
+				       bytes);
+		}
+	}
+
+	return 0;
+}
+
+int encoder_surface_put_image(struct object_surface *surface_object,
+			      VAImage *image, void *image_data)
+{
+	return encoder_image_copy(surface_object, image, image_data, false);
+}
+
+int encoder_surface_get_image(struct object_surface *surface_object,
+			      VAImage *image, void *image_data)
+{
+	return encoder_image_copy(surface_object, image, image_data, true);
+}
+
+/* ------------------------------------------------------------------------
+ * vaDeriveImage support: an image whose buffer aliases the surface storage
+ * --------------------------------------------------------------------- */
+
+VAStatus encoder_derive_image(VADriverContextP context,
+			      struct object_surface *surface_object,
+			      VAImage *image)
+{
+	struct request_data *driver_data = context->pDriverData;
+	struct object_image *image_object;
+	VABufferID buffer_id;
+	VAImageID id;
+	VAStatus status;
+	unsigned int size;
+
+	if (surface_object->enc_data == NULL)
+		request_log("encoder: derive surface %u (%ux%u)\n",
+			    (unsigned int)surface_object->base.id,
+			    surface_object->width, surface_object->height);
+
+	if (encoder_surface_ensure_storage(surface_object) < 0)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+	size = surface_object->enc_pitch * surface_object->enc_height * 3 / 2;
+
+	id = object_heap_allocate(&driver_data->image_heap);
+	image_object = IMAGE(driver_data, id);
+	if (image_object == NULL)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+	/*
+	 * The image buffer borrows the surface's NV12 storage: vaMapBuffer on
+	 * this image hands back the surface pixels and writes to it land
+	 * directly in the surface, which is exactly what ffmpeg's
+	 * vaDeriveImage-based hwupload path expects.
+	 */
+	status = RequestCreateBufferForeign(context, VAImageBufferType,
+					    surface_object->enc_data, size,
+					    &buffer_id);
+	if (status != VA_STATUS_SUCCESS) {
+		object_heap_free(&driver_data->image_heap,
+				 (struct object_base *)image_object);
+		return status;
+	}
+
+	memset(image, 0, sizeof(*image));
+	image->format.fourcc = VA_FOURCC_NV12;
+	image->format.byte_order = VA_LSB_FIRST;
+	image->format.bits_per_pixel = 12;
+	image->width = surface_object->enc_width;
+	image->height = surface_object->enc_height;
+	image->buf = buffer_id;
+	image->image_id = id;
+	image->num_planes = 2;
+	image->data_size = size;
+	image->pitches[0] = surface_object->enc_pitch;
+	image->pitches[1] = surface_object->enc_pitch;
+	image->offsets[0] = 0;
+	image->offsets[1] = surface_object->enc_pitch * surface_object->enc_height;
+
+	image_object->image = *image;
+
+	BUFFER(driver_data, buffer_id)->derived_surface_id =
+		(VASurfaceID)surface_object->base.id;
+
+	return VA_STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------
+ * Picture submission
+ * --------------------------------------------------------------------- */
+
+void encoder_begin_picture(struct request_data *driver_data,
+			   struct object_context *context_object,
+			   struct object_surface *surface_object)
+{
+	struct encoder_context *ec = context_object->encoder;
+
+	(void)driver_data;
+
+	ec->seq_valid = false;
+	ec->pic_valid = false;
+	ec->slice_valid = false;
+	ec->coded_buf = VA_INVALID_ID;
+	ec->misc_qp = -1;
+
+	encoder_surface_ensure_storage(surface_object);
+
+	surface_object->status = VASurfaceRendering;
+	context_object->render_surface_id = (VASurfaceID)surface_object->base.id;
+}
+
+static VAStatus encoder_store_buffer(struct encoder_context *ec,
+				     struct object_buffer *buffer_object)
+{
+	switch (buffer_object->type) {
+	case VAEncSequenceParameterBufferType:
+		if (buffer_object->size < sizeof(VAEncSequenceParameterBufferH264))
+			return VA_STATUS_ERROR_INVALID_PARAMETER;
+		memcpy(&ec->seq, buffer_object->data, sizeof(ec->seq));
+		ec->seq_valid = true;
+		break;
+
+	case VAEncPictureParameterBufferType:
+		if (buffer_object->size < sizeof(VAEncPictureParameterBufferH264))
+			return VA_STATUS_ERROR_INVALID_PARAMETER;
+		memcpy(&ec->pic, buffer_object->data, sizeof(ec->pic));
+		ec->pic_valid = true;
+		/*
+		 * ffmpeg >= 5.1 hands the coded buffer through
+		 * VAEncPictureParameterBufferH264.coded_buf instead of
+		 * passing it to vaRenderPicture().
+		 */
+		if (ec->pic.coded_buf != VA_INVALID_ID)
+			ec->coded_buf = ec->pic.coded_buf;
+		break;
+
+	case VAEncSliceParameterBufferType:
+		if (buffer_object->size < sizeof(VAEncSliceParameterBufferH264))
+			return VA_STATUS_ERROR_INVALID_PARAMETER;
+		/* Single slice per picture: the first slice buffer wins. */
+		if (!ec->slice_valid) {
+			memcpy(&ec->slice, buffer_object->data,
+			       sizeof(ec->slice));
+			ec->slice_valid = true;
+		}
+		break;
+
+	case VAEncMiscParameterBufferType: {
+		VAEncMiscParameterBuffer *misc = buffer_object->data;
+
+		if (buffer_object->size < sizeof(VAEncMiscParameterBuffer))
+			break;
+
+		/*
+		 * ffmpeg builds one misc parameter per buffer:
+		 * VAEncMiscParameterBuffer header followed by the payload.
+		 * Only RateControl carries anything we can act on (a
+		 * non-CQP consumer's initial QP); FrameRate / QualityLevel /
+		 * HRD are accepted and ignored.
+		 */
+		if (buffer_object->size >= sizeof(VAEncMiscParameterBuffer) +
+					   sizeof(VAEncMiscParameterRateControl) &&
+		    misc->type == VAEncMiscParameterTypeRateControl) {
+			VAEncMiscParameterRateControl *rc =
+				(VAEncMiscParameterRateControl *)misc->data;
+
+			if (rc->initial_qp > 0 && rc->initial_qp <= 51)
+				ec->misc_qp = rc->initial_qp;
+		}
+		break;
+	}
+
+	case VAEncCodedBufferType:
+		ec->coded_buf = (VABufferID)(buffer_object->base.id);
+		break;
+
+	default:
+		/* Packed headers and macroblock params are not used: the
+		 * former are not advertised (PackedHeaders = 0) and the
+		 * latter only appear when per-MB config is requested. */
+		break;
+	}
+
+	return VA_STATUS_SUCCESS;
+}
+
+VAStatus encoder_render_picture(struct request_data *driver_data,
+				struct object_context *context_object,
+				VABufferID *buffer_ids, int buffers_count)
+{
+	struct encoder_context *ec = context_object->encoder;
+	int i;
+
+	(void)driver_data;
+
+	for (i = 0; i < buffers_count; i++) {
+		struct object_buffer *buffer_object =
+			BUFFER(driver_data, buffer_ids[i]);
+		VAStatus status;
+
+		if (buffer_object == NULL)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+
+		status = encoder_store_buffer(ec, buffer_object);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+	}
+
+	return VA_STATUS_SUCCESS;
+}
+
+static unsigned int encoder_v4l2_slice_type(unsigned int va_slice_type)
+{
+	/* VA/H.264 slice_type: 5 bits, value % 5 gives the base type where
+	 * 0 = P, 1 = B, 2 = I. */
+	switch (va_slice_type % 5) {
+	case 0:
+		return V4L2_H264_SLICE_TYPE_P;
+	case 1:
+		return V4L2_H264_SLICE_TYPE_B;
+	case 2:
+	default:
+		return V4L2_H264_SLICE_TYPE_I;
+	}
+}
+
+static void encoder_fill_controls(struct encoder_context *ec)
+{
+	struct v4l2_ctrl_h264_encode_params *params = &ec->params;
+	struct v4l2_ctrl_h264_encode_rc *rc = &ec->rc;
+	const VAEncPictureParameterBufferH264 *pic = &ec->pic;
+	const VAEncSliceParameterBufferH264 *slice = &ec->slice;
+	int qp;
+
+	memset(params, 0, sizeof(*params));
+	memset(rc, 0, sizeof(*rc));
+
+	params->slice_type = encoder_v4l2_slice_type(slice->slice_type);
+	params->pic_parameter_set_id = 0;
+	params->frame_num = pic->frame_num;
+	params->idr_pic_id = slice->idr_pic_id;
+	params->cabac_init_idc = slice->cabac_init_idc;
+	params->disable_deblocking_filter_idc =
+		slice->disable_deblocking_filter_idc;
+	params->slice_alpha_c0_offset_div2 = slice->slice_alpha_c0_offset_div2;
+	params->slice_beta_offset_div2 = slice->slice_beta_offset_div2;
+	/* One slice per frame, so the whole picture. */
+	params->slice_size_mb_rows = (int32_t)ec->mb_height;
+	params->pic_init_qp_minus26 = (int8_t)pic->pic_init_qp - 26;
+	params->chroma_qp_index_offset = (int8_t)pic->chroma_qp_index_offset;
+
+	if (pic->pic_fields.bits.entropy_coding_mode_flag)
+		params->flags |= V4L2_H264_ENCODE_FLAG_ENTROPY_CODING_MODE;
+	if (encoder_profile_has_high_syntax(ec->profile) &&
+	    pic->pic_fields.bits.transform_8x8_mode_flag)
+		params->flags |= V4L2_H264_ENCODE_FLAG_TRANSFORM_8X8_MODE;
+	if (pic->pic_fields.bits.constrained_intra_pred_flag)
+		params->flags |= V4L2_H264_ENCODE_FLAG_CONSTRAINED_INTRA_PRED;
+
+	if (params->slice_type == V4L2_H264_SLICE_TYPE_P)
+		params->reference_ts = ec->last_ts;
+
+	/*
+	 * QP: the effective frame QP is the PPS init QP plus the slice delta.
+	 * ffmpeg puts the CQP value in pic_init_qp and leaves the delta at
+	 * zero; a misc RateControl buffer (non-CQP users) may override it.
+	 */
+	qp = (int)pic->pic_init_qp + (int)slice->slice_qp_delta;
+	if (ec->misc_qp >= 0)
+		qp = ec->misc_qp;
+	if (qp < 0)
+		qp = 0;
+	if (qp > 51)
+		qp = 51;
+
+	rc->qp = (uint32_t)qp;
+	rc->qp_min = 0;
+	rc->qp_max = 51;
+	rc->mad_qp_delta = 0;
+	rc->mad_threshold = 0;
+}
+
+/* Copy the input surface's NV12 storage into the V4L2 OUTPUT planes. */
+static int encoder_copy_surface(struct encoder_context *ec,
+				struct object_surface *surface_object,
+				struct encoder_buffer *output)
+{
+	unsigned int plane;
+	unsigned int width = surface_object->enc_width;
+	unsigned int height = surface_object->enc_height;
+	uint8_t *source = surface_object->enc_data;
+
+	if (source == NULL)
+		return -1;
+
+	if (width == 0 || height == 0)
+		return -1;
+
+	if (width > ec->output_width)
+		width = ec->output_width;
+
+	for (plane = 0; plane < ec->output_planes_count; plane++) {
+		unsigned int rows = plane == 0 ? height : height / 2;
+		unsigned int bytes = width;
+		unsigned int src_offset = plane == 0 ? 0 :
+			surface_object->enc_pitch * surface_object->enc_height;
+		unsigned int dst_pitch = ec->output_bytesperlines[plane] ?
+			ec->output_bytesperlines[plane] : width;
+		uint8_t *dst = output->map[plane];
+		uint8_t *src = source + src_offset;
+		unsigned int y;
+
+		if (dst == NULL)
+			return -1;
+
+		if (plane > 0 && rows > ec->output_height / 2)
+			rows = ec->output_height / 2;
+		if (plane == 0 && rows > ec->output_height)
+			rows = ec->output_height;
+
+		for (y = 0; y < rows; y++)
+			memcpy(dst + (size_t)y * dst_pitch,
+			       src + (size_t)y * surface_object->enc_pitch,
+			       bytes);
+	}
+
+	return 0;
+}
+
+VAStatus encoder_end_picture(struct request_data *driver_data,
+			     struct object_context *context_object)
+{
+	struct encoder_context *ec = context_object->encoder;
+	struct object_surface *surface_object;
+	struct encoder_buffer *output;
+	struct encoder_buffer *capture;
+	struct v4l2_ext_control controls[2];
+	struct object_buffer *coded_object;
+	VACodedBufferSegment *segment;
+	uint64_t capture_ts = 0;
+	uint8_t sps[512], pps[512];
+	unsigned int sps_size = 0, pps_size = 0;
+	unsigned int output_bytesused[ENCODER_MAX_PLANES];
+	unsigned int capture_bytesused[1];
+	unsigned int payload_size, header_size, total;
+	uint64_t timestamp;
+	uint8_t *payload;
+	int rc;
+
+	(void)driver_data;
+
+	if (ec == NULL)
+		return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+	surface_object = SURFACE(driver_data, context_object->render_surface_id);
+	if (surface_object == NULL)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	/*
+	 * ffmpeg only submits VAEncSequenceParameterBufferType on IDR
+	 * pictures, so a P picture legitimately has no sequence buffer.
+	 */
+	if (!ec->pic_valid || !ec->slice_valid ||
+	    (ec->pic.pic_fields.bits.idr_pic_flag && !ec->seq_valid)) {
+		request_log("encoder: incomplete picture (seq=%d pic=%d slice=%d idr=%d)\n",
+			    ec->seq_valid, ec->pic_valid, ec->slice_valid,
+			    ec->pic.pic_fields.bits.idr_pic_flag);
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	if (ec->coded_buf == VA_INVALID_ID) {
+		request_log("encoder: no VAEncCodedBufferType buffer for picture\n");
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	}
+
+	coded_object = BUFFER(driver_data, ec->coded_buf);
+	if (coded_object == NULL ||
+	    coded_object->type != VAEncCodedBufferType)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+
+	if (surface_object->enc_data == NULL) {
+		request_log("encoder: input surface %u has no uploaded pixels\n",
+			    (unsigned int)surface_object->base.id);
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	/*
+	 * SPS + PPS only on IDR pictures: the hardware writes nothing but the
+	 * slice NAL, so these are the only in-band parameter sets a decoder
+	 * ever sees.
+	 */
+	if (ec->pic.pic_fields.bits.idr_pic_flag) {
+		sps_size = encoder_build_sps(ec, sps, sizeof(sps));
+		pps_size = encoder_build_pps(ec, pps, sizeof(pps));
+		if (sps_size == 0 || pps_size == 0) {
+			request_log("encoder: SPS/PPS serialisation failed\n");
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		}
+	}
+
+	encoder_fill_controls(ec);
+
+	output = &ec->output[ec->output_index];
+	capture = &ec->capture[ec->capture_index];
+
+	ec->output_index = (ec->output_index + 1) % ec->output_count;
+	ec->capture_index = (ec->capture_index + 1) % ec->capture_count;
+
+	rc = encoder_copy_surface(ec, surface_object, output);
+	if (rc < 0) {
+		request_log("encoder: failed to copy input surface\n");
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	/*
+	 * V4L2 timestamps are nanoseconds and must be unique: the CAPTURE
+	 * buffer inherits this value (TIMESTAMP_COPY) and a later P picture
+	 * resolves its reference with vb2_find_buffer(reference_ts).  Spacing
+	 * by 1 ms keeps values far apart even at very long session lengths.
+	 */
+	ec->timestamp += 1000000;
+	timestamp = ec->timestamp;
+
+	for (unsigned int i = 0; i < ec->output_planes_count; i++) {
+		unsigned int pitch = ec->output_bytesperlines[i] ?
+				     ec->output_bytesperlines[i] :
+				     ec->output_width;
+
+		output_bytesused[i] = pitch * ec->output_height;
+		if (i > 0)
+			output_bytesused[i] /= 2;
+	}
+
+	/* 1. OUTPUT with the request attached. */
+	rc = v4l2_queue_buffer_timestamped(ec->video_fd, output->request_fd,
+					   ec->output_type, output->index,
+					   ec->output_planes_count,
+					   output_bytesused, timestamp);
+	if (rc < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	/* 2. CAPTURE, no request fd (request ownership is on OUTPUT). */
+	capture_bytesused[0] = 0;
+	rc = v4l2_queue_buffer_timestamped(ec->video_fd, -1, ec->capture_type,
+					   capture->index, 1,
+					   capture_bytesused, 0);
+	if (rc < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	/* 3. Controls on the request. */
+	memset(controls, 0, sizeof(controls));
+	controls[0].id = V4L2_CID_STATELESS_H264_ENCODE_PARAMS;
+	controls[0].ptr = &ec->params;
+	controls[0].size = sizeof(ec->params);
+	controls[1].id = V4L2_CID_STATELESS_H264_ENCODE_RC;
+	controls[1].ptr = &ec->rc;
+	controls[1].size = sizeof(ec->rc);
+
+	rc = v4l2_set_controls(ec->video_fd, output->request_fd, controls, 2);
+	if (rc < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	/* 4. Queue and wait. */
+	rc = media_request_queue(output->request_fd);
+	if (rc < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	request_log("encoder: submitted out=%u req=%d cap=%u ts=%llu type=%u\n",
+		    output->index, output->request_fd, capture->index,
+		    (unsigned long long)timestamp, ec->params.slice_type);
+
+	/* 2 s matches the hantro watchdog, so a stuck hardware job is
+	 * reported as a timeout rather than a short-poll false negative. */
+	rc = media_request_wait_completion_timeout(output->request_fd, 2500);
+	if (rc < 0) {
+		unsigned int diag_used[2] = { 0, 0 };
+		int rc2;
+
+		request_log("encoder: request completion failed (ts=%llu)\n",
+			    (unsigned long long)timestamp);
+		rc2 = v4l2_dequeue_buffer_info(ec->video_fd, ec->output_type,
+					       output->index,
+					       ec->output_planes_count,
+					       diag_used, NULL);
+		request_log("encoder: diag OUT dq rc=%d used=%u/%u\n", rc2,
+			    diag_used[0], diag_used[1]);
+		rc2 = v4l2_dequeue_buffer_info(ec->video_fd, ec->capture_type,
+					       capture->index, 1, diag_used,
+					       NULL);
+		request_log("encoder: diag CAP dq rc=%d used=%u\n", rc2,
+			    diag_used[0]);
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	/* 5. Reclaim both buffers. */
+	rc = v4l2_dequeue_buffer_info(ec->video_fd, ec->output_type,
+				      output->index, ec->output_planes_count,
+				      NULL, NULL);
+	if (rc < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	rc = v4l2_dequeue_buffer_info(ec->video_fd, ec->capture_type,
+				      capture->index, 1, capture_bytesused,
+				      &capture_ts);
+	if (rc < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	rc = media_request_reinit(output->request_fd);
+	if (rc < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	ec->last_ts = timestamp;
+
+	/* 6. Assemble the access unit in the VA coded buffer. */
+	payload_size = capture_bytesused[0];
+	if (payload_size == 0) {
+		request_log("encoder: hardware produced an empty slice NAL\n");
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	header_size = sizeof(VACodedBufferSegment);
+	total = header_size + sps_size + pps_size + payload_size;
+
+	if (coded_object->size < total) {
+		request_log("encoder: coded buffer too small (%u < %u: "
+			    "sps %u pps %u slice %u)\n",
+			    coded_object->size, total, sps_size, pps_size,
+			    payload_size);
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	payload = (uint8_t *)coded_object->data + header_size;
+	memcpy(payload, sps, sps_size);
+	memcpy(payload + sps_size, pps, pps_size);
+	memcpy(payload + sps_size + pps_size, capture->map[0], payload_size);
+
+	segment = coded_object->data;
+	memset(segment, 0, sizeof(*segment));
+	segment->size = sps_size + pps_size + payload_size;
+	segment->bit_offset = 0;
+	segment->status = 0;
+	segment->buf = payload;
+	segment->next = NULL;
+
+	ec->frame_count++;
+	surface_object->status = VASurfaceDisplaying;
+	context_object->render_surface_id = VA_INVALID_ID;
+
+	request_log("encoder: frame %llu %s slice=%u bytes sps=%u pps=%u qp=%u "
+		    "frame_num=%u ts=%llu cap_ts=%llu ref_ts=%llu\n",
+		    (unsigned long long)ec->frame_count,
+		    ec->params.slice_type == V4L2_H264_SLICE_TYPE_I ? "IDR" : "P",
+		    payload_size, sps_size, pps_size, ec->rc.qp,
+		    ec->params.frame_num,
+		    (unsigned long long)timestamp,
+		    (unsigned long long)capture_ts,
+		    (unsigned long long)ec->params.reference_ts);
+
+	return VA_STATUS_SUCCESS;
+}

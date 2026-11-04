@@ -1,0 +1,328 @@
+Only in a: .git
+diff -ru a/meson.build b/meson.build
+--- a/meson.build	2026-11-03 22:34:43.589837893 +0800
++++ b/meson.build	2026-11-03 22:12:47.903020954 +0800
+@@ -63,9 +63,8 @@
+ libva_dep = dependency('libva', version : '>= 1.1.0')
+ libdrm_dep = dependency('libdrm', version : '>= 2.4.52')
+ 
+-va_api_version_array = libva_dep.version().split('.')
+-va_api_major_version = va_api_version_array[0]
+-va_api_minor_version = va_api_version_array[1]
++va_api_major_version = cc.get_define('VA_MAJOR_VERSION', prefix: '#include <va/va_version.h>')
++va_api_minor_version = cc.get_define('VA_MINOR_VERSION', prefix: '#include <va/va_version.h>')
+ 
+ va_driver_init_func = '__vaDriverInit_@0@_@1@'.format(va_api_major_version,
+ 						      va_api_minor_version)
+Only in b: patches
+diff -ru a/src/context.c b/src/context.c
+--- a/src/context.c	2026-11-03 22:34:43.592741457 +0800
++++ b/src/context.c	2026-11-03 22:36:59.770669782 +0800
+@@ -745,12 +745,35 @@
+ 
+ 	/* Buffers liberation */
+ 
+-	status = RequestDestroySurfaces(context, context_object->surfaces_ids,
+-					context_object->surfaces_count);
+-	if (status != VA_STATUS_SUCCESS)
+-		return VA_STATUS_ERROR_OPERATION_FAILED;
++	/*
++	 * Do NOT destroy the surfaces here: VA surfaces are owned by the
++	 * application (vaCreateSurfaces/vaDestroySurfaces), not by the
++	 * context.  Freeing them on vaDestroyContext made a subsequent
++	 * vaDestroySurfaces() free the same object heap entry again, which
++	 * corrupts the heap (seen as SIGSEGV/SIGBUS/SIGABRT in FFmpeg when
++	 * it re-initialises the decoder, e.g. with -stream_loop).
++	 *
++	 * Their capture-pool bindings must be dropped before the pool is
++	 * destroyed below, otherwise a later vaDestroySurfaces() would
++	 * release slots into freed pool storage.
++	 */
++	{
++		struct object_surface *surface_object;
++		int iterator;
++
++		surface_object = (struct object_surface *)
++			object_heap_first(&driver_data->surface_heap, &iterator);
++		while (surface_object != NULL) {
++			surface_unbind_slot(driver_data, surface_object);
++			surface_object = (struct object_surface *)
++				object_heap_next(&driver_data->surface_heap,
++						 &iterator);
++		}
++	}
+ 
+ 	free(context_object->surfaces_ids);
++	context_object->surfaces_ids = NULL;
++	context_object->surfaces_count = 0;
+ 
+ 	object_heap_free(&driver_data->context_heap,
+ 			 (struct object_base *)context_object);
+diff -ru a/src/h264.c b/src/h264.c
+--- a/src/h264.c	2026-11-03 22:34:43.593064918 +0800
++++ b/src/h264.c	2026-11-03 22:32:09.213052386 +0800
+@@ -29,6 +29,7 @@
+ #include <limits.h>
+ #include <string.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -180,6 +181,16 @@
+ 
+ 		entry = dpb_lookup(context, pic, NULL, NULL);
+ 		if (entry) {
++			/*
++			 * The consumer reuses VA surface ids.  When a surface
++			 * that was decoded before an IDR is recycled, its DPB
++			 * entry still carries the pre-IDR frame_num / POC and
++			 * would poison the kernel's reference list builder.
++			 * The current VAPictureParameterBufferH264 (and its
++			 * ReferenceFrames[]) is authoritative, so refresh the
++			 * stored picture fields on every match.
++			 */
++			memcpy(&entry->pic, pic, sizeof(entry->pic));
+ 			entry->age = context->dpb.age;
+ 			entry->used = true;
+ 		} else {
+@@ -351,6 +362,28 @@
+ 		 */
+ 		dpb->fields = V4L2_H264_FRAME_REF;
+ 	}
++
++	/*
++	 * Compact the emitted entries towards dpb[0..n-1].  The kernel
++	 * builds its reference lists from dec_params->dpb itself, so the
++	 * absolute slot index is irrelevant; keeping the set dense matches
++	 * what GStreamer/FFmpeg feed rkvdec (dpb[0..n-1]) and avoids the
++	 * slot numbers drifting far above the active reference count as
++	 * the internal table recycles entries.
++	 */
++	{
++		unsigned int w = 0;
++
++		for (i = 0; i < H264_DPB_SIZE; i++) {
++			if (!(decode->dpb[i].flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
++				continue;
++			if (w != (unsigned int)i)
++				decode->dpb[w] = decode->dpb[i];
++			w++;
++		}
++		for (; w < H264_DPB_SIZE; w++)
++			memset(&decode->dpb[w], 0, sizeof(decode->dpb[w]));
++	}
+ }
+ 
+ static void h264_va_picture_to_v4l2(struct request_data *driver_data,
+@@ -556,8 +589,8 @@
+ 	 */
+ 	memcpy(v4l2_matrix->scaling_list_8x8[0], &VAMatrix->ScalingList8x8[0],
+ 	       sizeof(v4l2_matrix->scaling_list_8x8[0]));
+-	memcpy(v4l2_matrix->scaling_list_8x8[3], &VAMatrix->ScalingList8x8[1],
+-	       sizeof(v4l2_matrix->scaling_list_8x8[3]));
++	memcpy(v4l2_matrix->scaling_list_8x8[1], &VAMatrix->ScalingList8x8[1],
++	       sizeof(v4l2_matrix->scaling_list_8x8[1]));
+ }
+ 
+ /*
+@@ -898,18 +931,51 @@
+ 	else
+ 		h264_default_flat_scaling_matrix(&matrix);
+ 
++	/* Zero means "not provided"; flat (16) is the spec default. */
++	{
++		unsigned int zi;
++
++		for (zi = 0; zi < 6 * 16; zi++)
++			if (((unsigned char *)matrix.scaling_list_4x4)[zi] == 0)
++				((unsigned char *)matrix.scaling_list_4x4)[zi] = 16;
++		for (zi = 0; zi < 6 * 64; zi++)
++			if (((unsigned char *)matrix.scaling_list_8x8)[zi] == 0)
++				((unsigned char *)matrix.scaling_list_8x8)[zi] = 16;
++	}
++
+ 	h264_va_slice_to_v4l2(driver_data, context,
+ 			      &surface->params.h264.slice,
+ 			      &surface->params.h264.picture, &slice, &weights);
+ 
+ 	/*
+-	 * Mirror SCALING_MATRIX_PRESENT in PPS flags. Hantro G1 set_params
+-	 * gates its G1_REG_DEC_CTRL2_TYPE1_QUANT_E register bit on this;
+-	 * FFmpeg sets it unconditionally with the comment "FFmpeg always
+-	 * provide a scaling matrix." We submit the matrix always (above),
+-	 * so the flag must be set always to match.
++	 * Only advertise SCALING_MATRIX_PRESENT when the matrix is
++	 * non-flat: VAAPI does not carry the PPS's
++	 * scaling_matrix_present_flag, FFmpeg always forwards an IQ matrix
++	 * buffer (flat when the stream has none), and a flat list is
++	 * bit-identical to no list.  Claiming it for flat matrices changes
++	 * the reconstruction slightly on rkvdec.
+ 	 */
+-	pps.flags |= V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT;
++	{
++		unsigned int si;
++		bool nonflat = false;
++
++		for (si = 0; si < 6 && !nonflat; si++) {
++			unsigned int sj;
++
++			for (sj = 0; sj < 16; sj++)
++				if (matrix.scaling_list_4x4[si][sj] != 16) {
++					nonflat = true;
++					break;
++				}
++			for (sj = 0; sj < 64; sj++)
++				if (matrix.scaling_list_8x8[si][sj] != 16) {
++					nonflat = true;
++					break;
++				}
++		}
++		if (nonflat)
++			pps.flags |= V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT;
++	}
+ 
+ 	/*
+ 	 * Populate pps->num_ref_idx_l0/l1_default_active_minus1. Hantro G1
+diff -ru a/src/hevc-ctrls/v4l2-hevc-ext-controls.h b/src/hevc-ctrls/v4l2-hevc-ext-controls.h
+--- a/src/hevc-ctrls/v4l2-hevc-ext-controls.h	2026-11-03 22:34:43.597924705 +0800
++++ b/src/hevc-ctrls/v4l2-hevc-ext-controls.h	2026-11-03 22:12:59.787947178 +0800
+@@ -1,90 +1,10 @@
+ /*
+- * v4l2-hevc-ext-controls.h — verbatim mirror of Linux 7.0+ V4L2 stateless
+- * HEVC extended-SPS RPS control definitions, shipped as an internal
+- * header so this libva backend can be built against pre-7.0
+- * linux-api-headers packages (currently ampere ships 6.19-1).
++ * HEVC EXT_SPS_{ST,LT}_RPS UAPI definitions.
+  *
+- * Upstream source: linux kernel, include/uapi/linux/v4l2-controls.h
+- * As-of: Linux 7.0-rc3 (Detlev Casanova / Collabora "VDPU381/VDPU383"
+- * series, see lkml.org/lkml/2026/1/9/1334). The two CIDs + two structs
+- * + two flag macros below are byte-for-byte the kernel UAPI definitions.
+- *
+- * Once linux-api-headers >= 7.0 is the floor across the fleet, this
+- * shim becomes redundant — `<linux/v4l2-controls.h>` will provide the
+- * same symbols. The include order in h265.c is: this header BEFORE
+- * <linux/v4l2-controls.h>, so when the system catches up, the macro
+- * guards below silently no-op and we use the system definitions.
+- *
+- * License: MIT (matches backend's COPYING.MIT). Per LGPL § 3.b., the
+- * kernel UAPI struct definitions themselves are excepted from the
+- * kernel's overall GPL and may be copied verbatim into userspace
+- * binaries without inheriting GPL.
+- *
+- * Rationale + iter2 plan: see
+- *   ~/src/ampere-kernel-decoders/phase4_plan_iter2.md (§Step 3)
+- *   ~/src/ampere-kernel-decoders/phase0_findings_iter2.md
++ * These used to be vendored here because the host linux-api-headers could
++ * be older than Linux 7.0. Mainline Linux 7.0+ (and the 7.3.1 headers this
++ * driver is built against) define them in <linux/v4l2-controls.h>, so just
++ * use the kernel definitions to avoid redefinition errors.
+  */
+-
+-#ifndef LIBVA_V4L2_REQUEST_FOURIER_V4L2_HEVC_EXT_CONTROLS_H
+-#define LIBVA_V4L2_REQUEST_FOURIER_V4L2_HEVC_EXT_CONTROLS_H
+-
+-#include <linux/types.h>
++#pragma once
+ #include <linux/v4l2-controls.h>
+-
+-#ifndef V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS
+-# define V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS \
+-    (V4L2_CID_CODEC_STATELESS_BASE + 408)
+-#endif
+-
+-#ifndef V4L2_CID_STATELESS_HEVC_EXT_SPS_LT_RPS
+-# define V4L2_CID_STATELESS_HEVC_EXT_SPS_LT_RPS \
+-    (V4L2_CID_CODEC_STATELESS_BASE + 409)
+-#endif
+-
+-#ifndef V4L2_HEVC_EXT_SPS_ST_RPS_FLAG_INTER_REF_PIC_SET_PRED
+-# define V4L2_HEVC_EXT_SPS_ST_RPS_FLAG_INTER_REF_PIC_SET_PRED 0x1
+-#endif
+-
+-#ifndef V4L2_HEVC_EXT_SPS_LT_RPS_FLAG_USED_LT
+-# define V4L2_HEVC_EXT_SPS_LT_RPS_FLAG_USED_LT 0x1
+-#endif
+-
+-/*
+- * struct v4l2_ctrl_hevc_ext_sps_st_rps — HEVC short-term RPS parameters.
+- *
+- * Dynamic-size 1-dimension array. Number of elements is
+- *   v4l2_ctrl_hevc_sps::num_short_term_ref_pic_sets
+- * Can contain up to 65 elements (the H.265 spec § 7.4.3.2.1 maximum).
+- */
+-#ifndef V4L2_HEVC_EXT_SPS_ST_RPS_DEFINED
+-# define V4L2_HEVC_EXT_SPS_ST_RPS_DEFINED 1
+-struct v4l2_ctrl_hevc_ext_sps_st_rps {
+-	__u8	delta_idx_minus1;
+-	__u8	delta_rps_sign;
+-	__u8	num_negative_pics;
+-	__u8	num_positive_pics;
+-	__u32	used_by_curr_pic;
+-	__u32	use_delta_flag;
+-	__u16	abs_delta_rps_minus1;
+-	__u16	delta_poc_s0_minus1[16];
+-	__u16	delta_poc_s1_minus1[16];
+-	__u16	flags;
+-};
+-#endif
+-
+-/*
+- * struct v4l2_ctrl_hevc_ext_sps_lt_rps — HEVC long-term RPS parameters.
+- *
+- * Dynamic-size 1-dimension array. Number of elements is
+- *   v4l2_ctrl_hevc_sps::num_long_term_ref_pics_sps
+- * Can contain up to 33 elements (the H.265 spec § 7.4.3.2.1 maximum).
+- */
+-#ifndef V4L2_HEVC_EXT_SPS_LT_RPS_DEFINED
+-# define V4L2_HEVC_EXT_SPS_LT_RPS_DEFINED 1
+-struct v4l2_ctrl_hevc_ext_sps_lt_rps {
+-	__u16	lt_ref_pic_poc_lsb_sps;
+-	__u16	flags;
+-};
+-#endif
+-
+-#endif  /* LIBVA_V4L2_REQUEST_FOURIER_V4L2_HEVC_EXT_CONTROLS_H */
+diff -ru a/src/surface.c b/src/surface.c
+--- a/src/surface.c	2026-11-03 22:34:43.601340148 +0800
++++ b/src/surface.c	2026-11-03 22:36:59.768785899 +0800
+@@ -111,7 +111,14 @@
+ {
+ 	if (surface_object->current_slot == NULL)
+ 		return;
+-	cap_pool_release(&driver_data->capture_pool, surface_object->current_slot);
++	/*
++	 * The pool may already be gone (vaDestroyContext tears it down while
++	 * VA surfaces are still alive, because they are application-owned).
++	 * Never touch slot storage after cap_pool_destroy.
++	 */
++	if (driver_data->capture_pool.initialized)
++		cap_pool_release(&driver_data->capture_pool,
++				 surface_object->current_slot);
+ 	surface_object->current_slot = NULL;
+ }
+ 
+diff -ru a/src/utils.c b/src/utils.c
+--- a/src/utils.c	2026-11-03 22:34:43.601925527 +0800
++++ b/src/utils.c	2026-11-03 22:39:05.303699188 +0800
+@@ -32,8 +32,19 @@
+ 
+ void request_log(const char *format, ...)
+ {
++	static int enabled = -1;
+ 	va_list arguments;
+ 
++	/*
++	 * The backend is chatty (per-frame control dumps, pool setup).  Stay
++	 * quiet by default so applications do not get a log flood on stderr;
++	 * set LIBVA_V4L2_REQUEST_DEBUG=1 to get the diagnostics back.
++	 */
++	if (enabled < 0)
++		enabled = getenv("LIBVA_V4L2_REQUEST_DEBUG") != NULL;
++	if (!enabled)
++		return;
++
+ 	fprintf(stderr, "%s: ", V4L2_REQUEST_STR_VENDOR);
+ 
+ 	va_start(arguments, format);

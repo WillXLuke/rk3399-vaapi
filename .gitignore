@@ -1,0 +1,12 @@
+build/
+*.o
+*.ko
+*.cmd
+*.rej
+*.orig
+*.mod
+*.mod.c
+modules.order
+Module.symvers
+.cache/
+compile_commands.json

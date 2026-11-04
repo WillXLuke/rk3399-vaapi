@@ -1,0 +1,17 @@
+option(
+    'kernel_headers',
+    type : 'string',
+    value : '',
+    description: 'Path to sanitized Linux Kernel headers'
+)
+
+option(
+    'daedalus_v4l2',
+    type : 'boolean',
+    value : true,
+    description: 'Enable probe + dispatch for the out-of-tree daedalus_v4l2 ' +
+                 'stateless decoder shim (Pi 5 / CM5 daemon-backed VP9/AV1/H264). ' +
+                 'Default true; disable on platforms where the daedalus_v4l2 ' +
+                 'kernel module will never be present to slim the probe array.'
+)
+
