@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----------------------------------------------------------------------------
-Note on licensing of individual components:
-
-* userspace/ (the libva v4l2-request backend and the H.264 encode frontend)
-  is MIT licensed, following upstream libva-v4l2-request (Bootlin).
-* kernel/ contains Linux kernel driver code (the ported Hantro/VEPU2 H.264
-  encoder and the rkvdec module wrapper) and is GPL-2.0-only, as required by
-  the kernel it is derived from. Each file carries its own SPDX identifier.
