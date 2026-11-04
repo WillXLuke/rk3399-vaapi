@@ -182,3 +182,31 @@ meson setup build --buildtype=release \
   --prefix=/usr -Dlibdir=lib/aarch64-linux-gnu
 ninja -C build && sudo meson install -C build
 ```
+
+## Update: 10-second matrix, Main-profile fix, CBR/VBR
+
+A 10-second (300-frame) matrix across profiles and resolutions uncovered two
+real bugs and a missing feature:
+
+1. **Main profile produced garbage** (PSNR ~11.8 dB): the PPS writer forced
+   `entropy_coding_mode_flag = 0` for every non-High profile, while the encode
+   parameters still enabled CABAC for Main. The decoder got CAVLC while the
+   hardware emitted CABAC. Fixed by gating CAVLC only on Constrained Baseline.
+2. **CBR/VBR were rejected** (`vaCreateConfig` advertised CQP only), which is
+   what browser/WebRTC encoders request. A frame-level QP controller was added:
+   the target comes from `VAEncSequenceParameterBufferH264.bits_per_second`
+   (FFmpeg puts the CBR peak there, i.e. 2x the average) or the misc
+   RateControl buffer, and the QP adapts on the encoded frame size.
+3. **10-bit/odd geometry**: 854x480 encodes and decodes at the exact size.
+
+Measured after the fixes (10 s, 300 frames, testsrc2):
+
+| Resolution | Profile | Result |
+|---|---|---|
+| 640x480 | Constrained Baseline / Main / High | 45.1-45.2 dB |
+| 1280x720 | Constrained Baseline / Main / High | 45.2-45.4 dB |
+| 1920x1080 | Constrained Baseline / Main / High | 46.1-46.2 dB |
+| 1280x720 | Constrained Baseline, CBR 2500 kbps | 2606 kbps, decodes |
+| 1920x1080 | High, CBR 4000 kbps | 4089 kbps, decodes |
+
+Run `tests/encode-matrix.sh` to reproduce.
