@@ -289,7 +289,13 @@ static unsigned int encoder_build_pps(struct encoder_context *ec, uint8_t *out,
 	struct encoder_bitwriter bw;
 	unsigned int len;
 
-	if (!high)
+	/*
+	 * CABAC is only forbidden for Baseline/Constrained Baseline.  Main
+	 * allows CABAC (and normally uses it), so gating this on the "high
+	 * syntax" helper made the PPS advertise CAVLC while the hardware was
+	 * programmed for CABAC -> a decodable but completely wrong stream.
+	 */
+	if (ec->profile == VAProfileH264ConstrainedBaseline)
 		cabac = false;
 
 	bw_init(&bw, rbsp, sizeof(rbsp));
@@ -900,6 +906,27 @@ static VAStatus encoder_store_buffer(struct encoder_context *ec,
 			return VA_STATUS_ERROR_INVALID_PARAMETER;
 		memcpy(&ec->seq, buffer_object->data, sizeof(ec->seq));
 		ec->seq_valid = true;
+
+		/*
+		 * FFmpeg carries the rate-control target in the sequence
+		 * buffer (bits_per_second), not only in the misc buffer.
+		 */
+		if (ec->seq.bits_per_second > 0) {
+			/*
+			 * FFmpeg's CBR setup puts 2x the average bitrate in
+			 * bits_per_second (the peak/HRD rate), so target the
+			 * average here.
+			 */
+			ec->rc_active = true;
+			ec->rc_target_bps = ec->seq.bits_per_second / 2;
+		}
+		if (ec->seq.num_units_in_tick > 0 && ec->seq.time_scale > 0) {
+			unsigned int fps = (ec->seq.time_scale +
+					    ec->seq.num_units_in_tick) /
+					   (2 * ec->seq.num_units_in_tick);
+			if (fps > 0 && fps <= 240)
+				ec->rc_fps = fps;
+		}
 		break;
 
 	case VAEncPictureParameterBufferType:
@@ -948,6 +975,27 @@ static VAStatus encoder_store_buffer(struct encoder_context *ec,
 
 			if (rc->initial_qp > 0 && rc->initial_qp <= 51)
 				ec->misc_qp = rc->initial_qp;
+			if (rc->bits_per_second > 0) {
+				ec->rc_active = true;
+				ec->rc_target_bps = rc->bits_per_second / 2;
+				ec->rc_qp_min = rc->min_qp > 0 ? rc->min_qp : 10;
+				ec->rc_qp_max = rc->max_qp > 0 ? rc->max_qp : 45;
+				if (ec->rc_qp_max < ec->rc_qp_min)
+					ec->rc_qp_max = ec->rc_qp_min;
+			}
+		} else if (misc->type == VAEncMiscParameterTypeFrameRate &&
+			   buffer_object->size >= sizeof(VAEncMiscParameterBuffer) +
+						  sizeof(VAEncMiscParameterFrameRate)) {
+			VAEncMiscParameterFrameRate *fr =
+				(VAEncMiscParameterFrameRate *)misc->data;
+			uint32_t v = fr->framerate;
+
+			/* 16.16 fixed point in libva >= 1.x, plain integer in
+			 * older callers. */
+			if (v > 1000)
+				v >>= 16;
+			if (v >= 5 && v <= 240)
+				ec->rc_fps = v;
 		}
 		break;
 	}
@@ -1048,16 +1096,26 @@ static void encoder_fill_controls(struct encoder_context *ec)
 	 * zero; a misc RateControl buffer (non-CQP users) may override it.
 	 */
 	qp = (int)pic->pic_init_qp + (int)slice->slice_qp_delta;
-	if (ec->misc_qp >= 0)
-		qp = ec->misc_qp;
+	if (ec->rc_active) {
+		/* CBR/VBR: frame-level QP controller.  Seed from the
+		 * consumer's initial QP (or 26) and adapt after each frame. */
+		if (ec->rc_qp <= 0)
+			ec->rc_qp = ec->misc_qp > 0 ? ec->misc_qp : 26;
+		qp = ec->rc_qp;
+		rc->qp_min = (uint32_t)ec->rc_qp_min;
+		rc->qp_max = (uint32_t)ec->rc_qp_max;
+	} else {
+		if (ec->misc_qp >= 0)
+			qp = ec->misc_qp;
+		rc->qp_min = 0;
+		rc->qp_max = 51;
+	}
 	if (qp < 0)
 		qp = 0;
 	if (qp > 51)
 		qp = 51;
 
 	rc->qp = (uint32_t)qp;
-	rc->qp_min = 0;
-	rc->qp_max = 51;
 	rc->mad_qp_delta = 0;
 	rc->mad_threshold = 0;
 }
@@ -1295,6 +1353,34 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 
 	/* 6. Assemble the access unit in the VA coded buffer. */
 	payload_size = capture_bytesused[0];
+
+	/* CBR/VBR: adapt the QP towards the per-frame bit budget. */
+	if (ec->rc_active && payload_size > 0) {
+		unsigned int fps = ec->rc_fps ? ec->rc_fps : 30;
+		double budget = (double)ec->rc_target_bps / 8.0 / fps;
+		double err = (double)payload_size - budget;
+		int step = 0;
+
+		if (budget > 0) {
+			if (err > 0.15 * budget)
+				step = 2;
+			else if (err > 0.05 * budget)
+				step = 1;
+			else if (err < -0.15 * budget)
+				step = -2;
+			else if (err < -0.05 * budget)
+				step = -1;
+		}
+		ec->rc_qp += step;
+		if (ec->rc_qp < ec->rc_qp_min)
+			ec->rc_qp = ec->rc_qp_min;
+		if (ec->rc_qp > ec->rc_qp_max)
+			ec->rc_qp = ec->rc_qp_max;
+		if (ec->rc_qp < 1)
+			ec->rc_qp = 1;
+		if (ec->rc_qp > 51)
+			ec->rc_qp = 51;
+	}
 	if (payload_size == 0) {
 		request_log("encoder: hardware produced an empty slice NAL\n");
 		return VA_STATUS_ERROR_OPERATION_FAILED;

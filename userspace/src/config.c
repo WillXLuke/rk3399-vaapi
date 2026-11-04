@@ -439,10 +439,13 @@ VAStatus RequestGetConfigAttributes(VADriverContextP context, VAProfile profile,
 			break;
 
 		case VAConfigAttribRateControl:
-			/* VEPU2 fixed-QP only; VA_RC_NONE is accepted as a
-			 * "do whatever the SI says" alias. */
+			/* VEPU2 has no hardware rate control, but the
+			 * frontend implements a frame-level QP controller
+			 * for CBR/VBR so browser/WebRTC encoders can open
+			 * the config. */
 			attributes[i].value = encoder ?
-				(VA_RC_CQP | VA_RC_NONE) :
+				(VA_RC_CQP | VA_RC_CBR | VA_RC_VBR |
+				 VA_RC_NONE) :
 				VA_ATTRIB_NOT_SUPPORTED;
 			break;
 

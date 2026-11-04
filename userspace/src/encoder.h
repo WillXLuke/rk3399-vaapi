@@ -75,6 +75,15 @@ struct encoder_context {
 	VABufferID coded_buf;
 	int misc_qp;
 
+	/* Rate control (CBR/VBR): frame-level QP controller driven by the
+	 * misc RateControl/FrameRate parameters and the encoded size. */
+	bool rc_active;
+	unsigned int rc_target_bps;
+	unsigned int rc_fps;
+	int rc_qp;
+	int rc_qp_min;
+	int rc_qp_max;
+
 	/* Prepared V4L2 control payloads. */
 	struct v4l2_ctrl_h264_encode_params params;
 	struct v4l2_ctrl_h264_encode_rc rc;
