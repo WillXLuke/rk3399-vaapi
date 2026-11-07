@@ -88,6 +88,13 @@ struct encoder_context {
 	struct v4l2_ctrl_h264_encode_params params;
 	struct v4l2_ctrl_h264_encode_rc rc;
 
+	/* In-flight hardware request, reaped before the context is torn
+	 * down so buffers are never freed under a running job. */
+	int pending_request_fd;
+	unsigned int pending_output_index;
+	unsigned int pending_capture_index;
+	bool has_pending;
+
 	/* Reference bookkeeping (vb2_find_buffer on the CAPTURE queue). */
 	uint64_t last_ts;
 	uint64_t timestamp;

@@ -281,3 +281,16 @@ rule (`/etc/udev/rules.d/60-dma-heap.rules`) sets mode 0666 and
 
 Verified with `enc_export_test` (write frames only into the exported DMA-BUF,
 encode, decode): 30 frames at 42 dB PSNR, and 720p CBR regression unchanged.
+
+## Update: encoder teardown safety
+
+Rapid encoder re-initialisation (KasmVNC changing frame rate/quality, Sunshine
+probing encoders) could tear the VA context down while a V4L2 request was
+still in flight; the old code returned an error on a request timeout and left
+that request queued, so the next re-init freed buffers under a running job.
+
+`vaDestroyContext` now drains a pending request (wait for completion, dequeue
+both buffers) before releasing the queues, and a timed-out encode gets one
+extra wait so the hantro watchdog can finish before the buffers are touched.
+Stale DMA-BUF mirrors are dropped whenever the surface storage is
+reallocated, so a resolution change can no longer overrun the new buffer.

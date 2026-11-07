@@ -762,6 +762,24 @@ void encoder_context_destroy(struct encoder_context *ec)
 		return;
 
 	if (ec->video_fd >= 0) {
+		if (ec->has_pending && ec->pending_request_fd >= 0) {
+			request_log("encoder: draining request %d before destroy\n",
+				    ec->pending_request_fd);
+			if (media_request_wait_completion_timeout(
+				    ec->pending_request_fd, 3000) >= 0) {
+				v4l2_dequeue_buffer_info(ec->video_fd,
+							 ec->output_type,
+							 ec->pending_output_index,
+							 ec->output_planes_count,
+							 NULL, NULL);
+				v4l2_dequeue_buffer_info(ec->video_fd,
+							 ec->capture_type,
+							 ec->pending_capture_index,
+							 1, NULL, NULL);
+			}
+			ec->has_pending = false;
+		}
+
 		if (ec->streaming) {
 			v4l2_set_stream(ec->video_fd, ec->output_type, false);
 			v4l2_set_stream(ec->video_fd, ec->capture_type, false);
@@ -796,6 +814,9 @@ int encoder_surface_ensure_storage(struct object_surface *surface_object)
 		return 0;
 
 	if (surface_object->enc_data != NULL) {
+		/* The DMA-BUF mirror is sized for the old geometry; drop it
+		 * before the storage is replaced. */
+		encoder_surface_free_export(surface_object);
 		free(surface_object->enc_data);
 		surface_object->enc_data = NULL;
 	}
@@ -836,6 +857,14 @@ static void encoder_surface_pull_export(struct object_surface *surface_object)
 
 	if (surface_object->export_map == NULL || surface_object->enc_data == NULL)
 		return;
+
+	/* Never copy more than the current storage can hold: a resolution
+	 * change can leave a stale (larger) mirror behind. */
+	if (surface_object->export_size !=
+	    surface_object->enc_pitch * surface_object->enc_height * 3 / 2) {
+		encoder_surface_free_export(surface_object);
+		return;
+	}
 
 	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
 	ioctl(surface_object->export_fd, DMA_BUF_IOCTL_SYNC, &sync);
@@ -1606,6 +1635,11 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 	if (rc < 0)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
+	ec->has_pending = true;
+	ec->pending_request_fd = output->request_fd;
+	ec->pending_output_index = output->index;
+	ec->pending_capture_index = capture->index;
+
 	request_log("encoder: submitted out=%u req=%d cap=%u ts=%llu type=%u\n",
 		    output->index, output->request_fd, capture->index,
 		    (unsigned long long)timestamp, ec->params.slice_type);
@@ -1619,6 +1653,28 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 
 		request_log("encoder: request completion failed (ts=%llu)\n",
 			    (unsigned long long)timestamp);
+
+		/* Give the driver watchdog (2 s) a chance to finish and
+		 * reap the job ourselves from the dequeue side. */
+		rc = media_request_wait_completion_timeout(output->request_fd,
+							   3000);
+		if (rc >= 0) {
+			if (v4l2_dequeue_buffer_info(ec->video_fd,
+						     ec->output_type,
+						     output->index,
+						     ec->output_planes_count,
+						     NULL, NULL) >= 0)
+				v4l2_dequeue_buffer_info(ec->video_fd,
+							 ec->capture_type,
+							 capture->index, 1,
+							 capture_bytesused,
+							 &capture_ts);
+			media_request_reinit(output->request_fd);
+			ec->has_pending = false;
+			if (capture_bytesused[0] > 0)
+				goto got_payload;
+		}
+
 		rc2 = v4l2_dequeue_buffer_info(ec->video_fd, ec->output_type,
 					       output->index,
 					       ec->output_planes_count,
@@ -1652,6 +1708,9 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 
 	ec->last_ts = timestamp;
 
+	ec->has_pending = false;
+
+got_payload:
 	/* 6. Assemble the access unit in the VA coded buffer. */
 	payload_size = capture_bytesused[0];
 
