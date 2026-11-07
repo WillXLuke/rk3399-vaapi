@@ -1618,21 +1618,6 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 		ec->slice.slice_type = 7;
 	}
 
-	/*
-	 * SPS + PPS only on IDR pictures: the hardware writes nothing but the
-	 * slice NAL, so these are the only in-band parameter sets a decoder
-	 * ever sees.
-	 */
-	if (ec->pic.pic_fields.bits.idr_pic_flag) {
-		sps_size = encoder_build_sps(ec, sps, sizeof(sps));
-		pps_size = encoder_build_pps(ec, pps, sizeof(pps));
-		if (sps_size == 0 || pps_size == 0) {
-			ENCDBG("FAIL sps/pps serialisation\n");
-		request_log("encoder: SPS/PPS serialisation failed\n");
-			return VA_STATUS_ERROR_OPERATION_FAILED;
-		}
-	}
-
 	encoder_fill_controls(ec);
 
 	output = &ec->output[ec->output_index];
@@ -1688,6 +1673,15 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 			if (attempt > 0) {
 				ENCDBG("retry submission attempt=%u ts=%llu\n",
 				       attempt, (unsigned long long)timestamp);
+				/* A P picture whose reference the hardware
+				 * cannot resolve would fail forever; encode it
+				 * as a self-contained IDR instead. */
+				if (!ec->pic.pic_fields.bits.idr_pic_flag) {
+					ENCDBG("promote retried P picture to IDR\n");
+					ec->pic.pic_fields.bits.idr_pic_flag = 1;
+					ec->slice.slice_type = 7;
+					encoder_fill_controls(ec);
+				}
 				v4l2_dequeue_buffer_info(ec->video_fd,
 							 ec->output_type,
 							 output->index,
@@ -1784,12 +1778,54 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 			submitted = true;
 		}
 
-		if (!submitted)
+		if (!submitted) {
+			/*
+			 * The V4L2 session is wedged (typically a request the
+			 * hardware never completed because its reference could
+			 * not be resolved).  Abandon the file handle and retry
+			 * this picture on a fresh session, as an IDR.
+			 */
+			if (ec->recovery_count == 0) {
+				struct encoder_context *fresh =
+					encoder_context_create(driver_data,
+							       ec->profile,
+							       ec->width,
+							       ec->height);
+				if (fresh != NULL) {
+					ENCDBG("recovering: new encoder session\n");
+					fresh->seq = ec->seq;
+					fresh->pic = ec->pic;
+					fresh->slice = ec->slice;
+					fresh->seq_valid = ec->seq_valid;
+					fresh->coded_buf = ec->coded_buf;
+					fresh->recovery_count = 1;
+					encoder_context_destroy(ec);
+					context_object->encoder = fresh;
+					return encoder_end_picture(driver_data,
+								   context_object);
+				}
+			}
 			return VA_STATUS_ERROR_OPERATION_FAILED;
+		}
 	}
 
 	/* 6. Assemble the access unit in the VA coded buffer. */
 	payload_size = capture_bytesused[0];
+
+	/*
+	 * SPS + PPS only on IDR pictures: the hardware writes nothing but the
+	 * slice NAL, so these are the only in-band parameter sets a decoder
+	 * ever sees.  Rebuilt here because a retry may have promoted a P
+	 * picture to IDR.
+	 */
+	if (ec->pic.pic_fields.bits.idr_pic_flag) {
+		sps_size = encoder_build_sps(ec, sps, sizeof(sps));
+		pps_size = encoder_build_pps(ec, pps, sizeof(pps));
+		if (sps_size == 0 || pps_size == 0) {
+			ENCDBG("FAIL sps/pps serialisation\n");
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		}
+	}
 
 	ENCDBG("END   frame=%llu surface=%u idr=%d slice=%u qp=%u payload=%u\n",
 	       ec->frame_count, (unsigned)surface_object->base.id,

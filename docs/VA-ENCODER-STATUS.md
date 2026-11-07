@@ -359,3 +359,26 @@ Session configuration: the desktop is 1280x720, `encoding.max_frame_rate: 60`
 produces `Xvnc -FrameRate 60`.  Note `video_streaming_mode.frame_rate` is not
 a valid key (KasmVNC refuses to start); the frame rate slider in the web UI
 is a client-side setting bounded by the server's max_frame_rate.
+
+## Update: dropped P pictures and stuck requests (black screen at connect)
+
+KasmVNC's first seconds were black because the encoder was failing and it
+sends skip frames in that case. The driver log showed `FAIL wait timeout`
+followed by cascading `FAIL qbuf out` errors.
+
+Cause: the hantro encoder's `run()` returns -EINVAL when the reference buffer
+for a P picture cannot be resolved by `vb2_find_buffer()`, and that error path
+in `hantro_drv.c` finishes the buffers without calling
+`v4l2_ctrl_request_complete()`. The media request therefore never completes,
+the userspace wait times out, and the buffer stays queued forever.
+
+Two-sided recovery:
+
+* userspace retries the picture as an IDR (self-contained, no reference)
+  when a submission fails;
+* if the session is still wedged, the encoder context abandons its V4L2 file
+  handle, opens a fresh one and retries the picture there, so a stuck request
+  cannot poison the rest of the stream.
+
+Verified with the 72-combination libavcodec matrix, destroy/re-create,
+two simultaneous contexts, 720p60 and 1080p60 encodes and VAAPI decode.

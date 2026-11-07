@@ -94,6 +94,7 @@ struct encoder_context {
 	unsigned int pending_output_index;
 	unsigned int pending_capture_index;
 	bool has_pending;
+	int recovery_count;
 
 	/* Reference bookkeeping (vb2_find_buffer on the CAPTURE queue). */
 	uint64_t last_ts;
