@@ -203,6 +203,9 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 
 		surface_object->current_slot = NULL;	/* iter2 Fix 3 */
 		surface_object->enc_data = NULL;	/* encoder storage */
+		surface_object->export_fd = -1;
+		surface_object->export_map = NULL;
+		surface_object->export_size = 0;
 		surface_object->enc_pitch = 0;
 		surface_object->enc_width = 0;
 		surface_object->enc_height = 0;
@@ -275,6 +278,7 @@ VAStatus RequestDestroySurfaces(VADriverContextP context,
 		surface_unbind_slot(driver_data, surface_object);
 
 		/* Encoder-owned NV12 storage (vaPutImage / derive upload). */
+		encoder_surface_free_export(surface_object);
 		encoder_surface_free_storage(surface_object);
 
 		/*
@@ -711,8 +715,6 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 	int rc;
 
 	video_format = driver_data->video_format;
-	if (video_format == NULL)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
 		return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
@@ -720,6 +722,14 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	if (video_format == NULL) {
+		/* Encoder input surface: export a linear NV12 DMA-BUF. */
+		if (encoder_surface_export(surface_object, flags,
+					   descriptor) < 0)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		return VA_STATUS_SUCCESS;
+	}
 
 	export_fds_count = surface_object->destination_buffers_count;
 	export_fds = malloc(export_fds_count * sizeof(*export_fds));

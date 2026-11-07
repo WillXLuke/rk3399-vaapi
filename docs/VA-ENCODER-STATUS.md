@@ -254,3 +254,30 @@ The SPS writer now:
   constraint_set0/1).
 
 Regression: 720p Constrained Baseline/Main/High still 45.4 dB, decode unchanged.
+
+## Update: vaExportSurfaceHandle (DMA-BUF) — Sunshine support
+
+Sunshine's VAAPI encoder failed at start-up with
+`Couldn't export va surface handle: operation failed` and fell back to
+libx264. It renders the captured frame into a VA surface through EGL and
+therefore needs the surface exported as a DMA-BUF
+(`vaExportSurfaceHandle(..., DRM_PRIME_2, WRITE_ONLY | SEPARATE_LAYERS)`).
+
+The driver now implements this for encoder surfaces:
+
+* the surface's NV12 storage gets a mirror allocated from the kernel system
+  heap (`/dev/dma_heap/system`), mmap'd by the driver and importable by the
+  GPU;
+* the descriptor exposes one DMA-BUF object, two layers (`DRM_FORMAT_R8` for
+  luma, `DRM_FORMAT_GR88` for interleaved chroma, linear modifier), with the
+  correct offsets and pitch;
+* the DMA-BUF contents are copied back into the encoder storage (with
+  `DMA_BUF_IOCTL_SYNC`) before every encode, so GPU rendering into the
+  exported buffer reaches the encoder.
+
+`/dev/dma_heap/system` needs to be accessible to the session user; a udev
+rule (`/etc/udev/rules.d/60-dma-heap.rules`) sets mode 0666 and
+`/etc/modules-load.d/dma-heap.conf` loads `system_heap` at boot.
+
+Verified with `enc_export_test` (write frames only into the exported DMA-BUF,
+encode, decode): 30 frames at 42 dB PSNR, and 720p CBR regression unchanged.

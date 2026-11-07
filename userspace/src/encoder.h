@@ -123,6 +123,9 @@ int encoder_surface_put_image(struct object_surface *surface_object,
 			      VAImage *image, void *image_data);
 int encoder_surface_get_image(struct object_surface *surface_object,
 			      VAImage *image, void *image_data);
+void encoder_surface_free_export(struct object_surface *surface_object);
+int encoder_surface_export(struct object_surface *surface_object,
+			   uint32_t flags, void *descriptor);
 int encoder_surface_put_image_rect(struct object_surface *surface_object,
 				   VAImage *image, void *image_data,
 				   int src_x, int src_y, int dst_x, int dst_y,

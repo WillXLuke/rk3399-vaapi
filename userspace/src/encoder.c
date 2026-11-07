@@ -25,6 +25,12 @@
 
 #include <unistd.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/dma-heap.h>
+#include <linux/dma-buf.h>
+#include <va/va_drmcommon.h>
 
 /* File-gated diagnostics: touch /tmp/libva-enc-debug to enable. */
 static FILE *enc_debug_file(void)
@@ -812,6 +818,132 @@ int encoder_surface_ensure_storage(struct object_surface *surface_object)
 	return 0;
 }
 
+void encoder_surface_free_export(struct object_surface *surface_object)
+{
+	if (surface_object->export_map != NULL)
+		munmap(surface_object->export_map, surface_object->export_size);
+	if (surface_object->export_fd >= 0)
+		close(surface_object->export_fd);
+	surface_object->export_map = NULL;
+	surface_object->export_fd = -1;
+	surface_object->export_size = 0;
+}
+
+/* Copy GPU-written contents of the exported DMA-BUF back into enc_data. */
+static void encoder_surface_pull_export(struct object_surface *surface_object)
+{
+	struct dma_buf_sync sync;
+
+	if (surface_object->export_map == NULL || surface_object->enc_data == NULL)
+		return;
+
+	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+	ioctl(surface_object->export_fd, DMA_BUF_IOCTL_SYNC, &sync);
+	memcpy(surface_object->enc_data, surface_object->export_map,
+	       surface_object->export_size);
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+	ioctl(surface_object->export_fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
+/*
+ * Export the surface as a linear NV12 DMA-BUF.
+ *
+ * The buffer comes from the kernel's system heap so it can be mmap'd by us
+ * and imported by a GPU driver (panfrost) at the same time.  Consumers such
+ * as Sunshine render the captured frame into it through EGL; the contents
+ * are copied back into enc_data before the next encode.
+ */
+int encoder_surface_export(struct object_surface *surface_object,
+			   uint32_t flags, void *descriptor)
+{
+	VADRMPRIMESurfaceDescriptor *desc = descriptor;
+	unsigned int size;
+	int heap_fd;
+	void *map;
+
+	if (encoder_surface_ensure_storage(surface_object) < 0)
+		return -1;
+
+	size = surface_object->enc_pitch * surface_object->enc_height * 3 / 2;
+
+	if (surface_object->export_map != NULL && surface_object->export_size != size) {
+		encoder_surface_free_export(surface_object);
+	}
+
+	if (surface_object->export_map == NULL) {
+		struct dma_heap_allocation_data req = {
+			.len = size,
+			.fd_flags = O_RDWR | O_CLOEXEC,
+			.heap_flags = 0,
+		};
+
+		heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+		if (heap_fd < 0)
+			return -1;
+		if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &req) < 0) {
+			close(heap_fd);
+			return -1;
+		}
+		close(heap_fd);
+
+		map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			   req.fd, 0);
+		if (map == MAP_FAILED) {
+			close(req.fd);
+			return -1;
+		}
+		surface_object->export_fd = req.fd;
+		surface_object->export_map = map;
+		surface_object->export_size = size;
+		memcpy(map, surface_object->enc_data, size);
+	}
+
+	/* Keep the dmabuf in sync with any uploads done through the
+	 * vaPutImage/vaDeriveImage paths. */
+	memcpy(surface_object->export_map, surface_object->enc_data,
+	       surface_object->export_size);
+
+	desc->fourcc = VA_FOURCC_NV12;
+	desc->width = surface_object->enc_width;
+	desc->height = surface_object->enc_height;
+	desc->num_objects = 1;
+	desc->objects[0].fd = dup(surface_object->export_fd);
+	if (desc->objects[0].fd < 0)
+		return -1;
+	desc->objects[0].size = surface_object->export_size;
+	desc->objects[0].drm_format_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
+
+	if (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) {
+		desc->num_layers = 2;
+		/* Y plane. */
+		desc->layers[0].drm_format = VA_FOURCC('R', '8', ' ', ' ');
+		desc->layers[0].num_planes = 1;
+		desc->layers[0].object_index[0] = 0;
+		desc->layers[0].offset[0] = 0;
+		desc->layers[0].pitch[0] = surface_object->enc_pitch;
+		/* Interleaved UV plane. */
+		desc->layers[1].drm_format = VA_FOURCC('G', 'R', '8', '8');
+		desc->layers[1].num_planes = 1;
+		desc->layers[1].object_index[0] = 0;
+		desc->layers[1].offset[0] =
+			surface_object->enc_pitch * surface_object->enc_height;
+		desc->layers[1].pitch[0] = surface_object->enc_pitch;
+	} else {
+		desc->num_layers = 1;
+		desc->layers[0].drm_format = VA_FOURCC_NV12;
+		desc->layers[0].num_planes = 2;
+		desc->layers[0].object_index[0] = 0;
+		desc->layers[0].object_index[1] = 0;
+		desc->layers[0].offset[0] = 0;
+		desc->layers[0].offset[1] =
+			surface_object->enc_pitch * surface_object->enc_height;
+		desc->layers[0].pitch[0] = surface_object->enc_pitch;
+		desc->layers[0].pitch[1] = surface_object->enc_pitch;
+	}
+
+	return 0;
+}
+
 void encoder_surface_free_storage(struct object_surface *surface_object)
 {
 	if (surface_object->enc_data != NULL)
@@ -1357,6 +1489,8 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 	surface_object = SURFACE(driver_data, context_object->render_surface_id);
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	encoder_surface_pull_export(surface_object);
 
 	ENCDBG("begin ctx=%p frame=%llu surface=%u enc=%dx%d data=%p pitch=%u\n",
 	       (void *)ec, ec->frame_count, (unsigned)surface_object->base.id,

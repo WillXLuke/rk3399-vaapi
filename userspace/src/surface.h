@@ -101,6 +101,15 @@ struct object_surface {
 	unsigned int enc_width;
 	unsigned int enc_height;
 
+	/*
+	 * Optional DMA-BUF mirror of enc_data for vaExportSurfaceHandle().
+	 * Consumers such as Sunshine render into the exported buffer with
+	 * the GPU, so its contents are copied back before each encode.
+	 */
+	int export_fd;
+	void *export_map;
+	unsigned int export_size;
+
 	union {
 		struct {
 			VAPictureParameterBufferMPEG2 picture;
