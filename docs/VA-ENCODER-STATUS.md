@@ -343,3 +343,19 @@ test, the 45.5 dB profile matrix, DMA-BUF export and VAAPI decode.
 
 ICQ and QVBR are rejected by libavcodec at `avcodec_open2` because the driver
 only advertises CQP, CBR, VBR and NONE.
+
+## Update: submission retry, KasmVNC 720p60 configuration
+
+KasmVNC logs `Error sending frame to codec (Input/output error)` shortly
+before the libavcodec DPB abort: a single failed `vaEndPicture` is enough to
+corrupt hw_base_encode's picture bookkeeping, which then asserts ~30 s later.
+
+`vaEndPicture` now retries the whole submission up to three times (re-queue
+both buffers, re-arm the request, wait for the hantro watchdog, reclaim,
+`MEDIA_REQUEST_REINIT`) and only fails if every attempt fails, so a transient
+V4L2 error no longer reaches ffmpeg.
+
+Session configuration: the desktop is 1280x720, `encoding.max_frame_rate: 60`
+produces `Xvnc -FrameRate 60`.  Note `video_streaming_mode.frame_rate` is not
+a valid key (KasmVNC refuses to start); the frame rate slider in the web UI
+is a client-side setting bounded by the server's max_frame_rate.

@@ -1667,127 +1667,127 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 			output_bytesused[i] /= 2;
 	}
 
-	/* 1. OUTPUT with the request attached. */
-	rc = v4l2_queue_buffer_timestamped(ec->video_fd, output->request_fd,
-					   ec->output_type, output->index,
-					   ec->output_planes_count,
-					   output_bytesused, timestamp);
-	if (rc < 0) {
-		ENCDBG("FAIL qbuf out rc=%d\n", rc);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-	}
+	/*
+	 * Submit with recovery.  A transient V4L2/request failure must not
+	 * reach ffmpeg: hw_base_encode assumes every submitted picture
+	 * yields a packet and aborts on its DPB assertion otherwise.
+	 */
+	{
+		bool submitted = false;
+		unsigned int attempt;
 
-	/* 2. CAPTURE, no request fd (request ownership is on OUTPUT). */
-	capture_bytesused[0] = 0;
-	rc = v4l2_queue_buffer_timestamped(ec->video_fd, -1, ec->capture_type,
-					   capture->index, 1,
-					   capture_bytesused, 0);
-	if (rc < 0) {
-		ENCDBG("FAIL qbuf cap rc=%d\n", rc);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-	}
+		memset(controls, 0, sizeof(controls));
+		controls[0].id = V4L2_CID_STATELESS_H264_ENCODE_PARAMS;
+		controls[0].ptr = &ec->params;
+		controls[0].size = sizeof(ec->params);
+		controls[1].id = V4L2_CID_STATELESS_H264_ENCODE_RC;
+		controls[1].ptr = &ec->rc;
+		controls[1].size = sizeof(ec->rc);
 
-	/* 3. Controls on the request. */
-	memset(controls, 0, sizeof(controls));
-	controls[0].id = V4L2_CID_STATELESS_H264_ENCODE_PARAMS;
-	controls[0].ptr = &ec->params;
-	controls[0].size = sizeof(ec->params);
-	controls[1].id = V4L2_CID_STATELESS_H264_ENCODE_RC;
-	controls[1].ptr = &ec->rc;
-	controls[1].size = sizeof(ec->rc);
-
-	rc = v4l2_set_controls(ec->video_fd, output->request_fd, controls, 2);
-	if (rc < 0) {
-		ENCDBG("FAIL set controls rc=%d\n", rc);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-	}
-
-	/* 4. Queue and wait. */
-	rc = media_request_queue(output->request_fd);
-	if (rc < 0) {
-		ENCDBG("FAIL media_request_queue rc=%d\n", rc);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-	}
-
-	ec->has_pending = true;
-	ec->pending_request_fd = output->request_fd;
-	ec->pending_output_index = output->index;
-	ec->pending_capture_index = capture->index;
-
-	request_log("encoder: submitted out=%u req=%d cap=%u ts=%llu type=%u\n",
-		    output->index, output->request_fd, capture->index,
-		    (unsigned long long)timestamp, ec->params.slice_type);
-
-	/* 2 s matches the hantro watchdog, so a stuck hardware job is
-	 * reported as a timeout rather than a short-poll false negative. */
-	rc = media_request_wait_completion_timeout(output->request_fd, 2500);
-	if (rc < 0) {
-		unsigned int diag_used[2] = { 0, 0 };
-		int rc2;
-
-		ENCDBG("FAIL wait timeout ts=%llu\n", (unsigned long long)timestamp);
-		request_log("encoder: request completion failed (ts=%llu)\n",
-			    (unsigned long long)timestamp);
-
-		/* Give the driver watchdog (2 s) a chance to finish and
-		 * reap the job ourselves from the dequeue side. */
-		rc = media_request_wait_completion_timeout(output->request_fd,
-							   3000);
-		if (rc >= 0) {
-			if (v4l2_dequeue_buffer_info(ec->video_fd,
-						     ec->output_type,
-						     output->index,
-						     ec->output_planes_count,
-						     NULL, NULL) >= 0)
+		for (attempt = 0; attempt < 3 && !submitted; attempt++) {
+			if (attempt > 0) {
+				ENCDBG("retry submission attempt=%u ts=%llu\n",
+				       attempt, (unsigned long long)timestamp);
+				v4l2_dequeue_buffer_info(ec->video_fd,
+							 ec->output_type,
+							 output->index,
+							 ec->output_planes_count,
+							 NULL, NULL);
 				v4l2_dequeue_buffer_info(ec->video_fd,
 							 ec->capture_type,
-							 capture->index, 1,
-							 capture_bytesused,
-							 &capture_ts);
-			media_request_reinit(output->request_fd);
+							 capture->index, 1, NULL,
+							 NULL);
+				media_request_reinit(output->request_fd);
+			}
+
+			/* 1. OUTPUT with the request attached. */
+			rc = v4l2_queue_buffer_timestamped(
+				ec->video_fd, output->request_fd,
+				ec->output_type, output->index,
+				ec->output_planes_count, output_bytesused,
+				timestamp);
+			if (rc < 0) {
+				ENCDBG("FAIL qbuf out rc=%d attempt=%u\n", rc,
+				       attempt);
+				continue;
+			}
+
+			/* 2. CAPTURE, no request fd. */
+			capture_bytesused[0] = 0;
+			rc = v4l2_queue_buffer_timestamped(
+				ec->video_fd, -1, ec->capture_type,
+				capture->index, 1, capture_bytesused, 0);
+			if (rc < 0) {
+				ENCDBG("FAIL qbuf cap rc=%d attempt=%u\n", rc,
+				       attempt);
+				continue;
+			}
+
+			/* 3. Controls on the request. */
+			rc = v4l2_set_controls(ec->video_fd,
+					       output->request_fd, controls, 2);
+			if (rc < 0) {
+				ENCDBG("FAIL set controls rc=%d attempt=%u\n",
+				       rc, attempt);
+				continue;
+			}
+
+			/* 4. Queue and wait. */
+			rc = media_request_queue(output->request_fd);
+			if (rc < 0) {
+				ENCDBG("FAIL request_queue rc=%d attempt=%u\n",
+				       rc, attempt);
+				continue;
+			}
+
+			ec->has_pending = true;
+			ec->pending_request_fd = output->request_fd;
+			ec->pending_output_index = output->index;
+			ec->pending_capture_index = capture->index;
+
+			/* The hantro watchdog fires at ~2 s. */
+			rc = media_request_wait_completion_timeout(
+				output->request_fd, 2500);
+			if (rc < 0) {
+				ENCDBG("FAIL wait timeout attempt=%u ts=%llu\n",
+				       attempt,
+				       (unsigned long long)timestamp);
+				continue;
+			}
+
+			/* 5. Reclaim both buffers. */
+			rc = v4l2_dequeue_buffer_info(
+				ec->video_fd, ec->output_type, output->index,
+				ec->output_planes_count, NULL, NULL);
+			if (rc < 0) {
+				ENCDBG("FAIL dq out rc=%d attempt=%u\n", rc,
+				       attempt);
+				continue;
+			}
+			rc = v4l2_dequeue_buffer_info(
+				ec->video_fd, ec->capture_type, capture->index,
+				1, capture_bytesused, &capture_ts);
+			if (rc < 0) {
+				ENCDBG("FAIL dq cap rc=%d attempt=%u\n", rc,
+				       attempt);
+				continue;
+			}
+			rc = media_request_reinit(output->request_fd);
+			if (rc < 0) {
+				ENCDBG("FAIL request_reinit rc=%d attempt=%u\n",
+				       rc, attempt);
+				continue;
+			}
+
+			ec->last_ts = timestamp;
 			ec->has_pending = false;
-			if (capture_bytesused[0] > 0)
-				goto got_payload;
+			submitted = true;
 		}
 
-		rc2 = v4l2_dequeue_buffer_info(ec->video_fd, ec->output_type,
-					       output->index,
-					       ec->output_planes_count,
-					       diag_used, NULL);
-		request_log("encoder: diag OUT dq rc=%d used=%u/%u\n", rc2,
-			    diag_used[0], diag_used[1]);
-		rc2 = v4l2_dequeue_buffer_info(ec->video_fd, ec->capture_type,
-					       capture->index, 1, diag_used,
-					       NULL);
-		request_log("encoder: diag CAP dq rc=%d used=%u\n", rc2,
-			    diag_used[0]);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
+		if (!submitted)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
 	}
 
-	/* 5. Reclaim both buffers. */
-	rc = v4l2_dequeue_buffer_info(ec->video_fd, ec->output_type,
-				      output->index, ec->output_planes_count,
-				      NULL, NULL);
-	if (rc < 0) {
-		ENCDBG("FAIL dq out rc=%d\n", rc);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-	}
-
-	rc = v4l2_dequeue_buffer_info(ec->video_fd, ec->capture_type,
-				      capture->index, 1, capture_bytesused,
-				      &capture_ts);
-	if (rc < 0)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	rc = media_request_reinit(output->request_fd);
-	if (rc < 0)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	ec->last_ts = timestamp;
-
-	ec->has_pending = false;
-
-got_payload:
 	/* 6. Assemble the access unit in the VA coded buffer. */
 	payload_size = capture_bytesused[0];
 
