@@ -48,7 +48,8 @@ static FILE *enc_debug_file(void)
 
 #define ENCDBG(...) do { \
 	FILE *dbgf = enc_debug_file(); \
-	if (dbgf) { fprintf(dbgf, __VA_ARGS__); fflush(dbgf); } \
+	if (dbgf) { fprintf(dbgf, "[%d] ", (int)getpid()); \
+		    fprintf(dbgf, __VA_ARGS__); fflush(dbgf); } \
 } while (0)
 
 
@@ -644,7 +645,8 @@ struct encoder_context *encoder_context_create(struct request_data *driver_data,
 	ec->capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	ec->coded_buf = VA_INVALID_ID;
 	ec->last_ts = 0;
-	ec->timestamp = 0;
+	/* Keep ec->timestamp monotonic: the V4L2 queue is reused, so timestamps
+	 * must not go backwards across contexts. */
 	ec->frame_count = 0;
 	for (i = 0; i < 8; i++) {
 		ec->output[i].request_fd = -1;
@@ -747,11 +749,37 @@ struct encoder_context *encoder_context_create(struct request_data *driver_data,
 
 	ec->streaming = true;
 
+	ENCDBG("CREATE fd=%d media=%d %ux%u out=%u cap=%u\n", ec->video_fd,
+	       ec->media_fd, width, height, ec->output_count, ec->capture_count);
+
 	return ec;
 
 error:
+	ENCDBG("CREATE failed rc=%d\n", rc);
 	encoder_context_destroy(ec);
 	return NULL;
+}
+
+/* Reset per-picture state when a VA context reuses an existing session. */
+void encoder_context_reset(struct encoder_context *ec)
+{
+	ec->seq_valid = false;
+	ec->pic_valid = false;
+	ec->slice_valid = false;
+	ec->coded_buf = VA_INVALID_ID;
+	ec->misc_qp = -1;
+	ec->last_ts = 0;
+	/* The V4L2 queue is reused, so its timestamps must stay monotonic
+	 * across contexts: do not reset ec->timestamp here. */
+	ec->frame_count = 0;
+	ec->has_pending = false;
+	ec->pending_request_fd = -1;
+	ec->rc_active = false;
+	ec->rc_qp = 0;
+	ec->rc_qp_min = 10;
+	ec->rc_qp_max = 45;
+	ec->rc_target_bps = 0;
+	ec->rc_fps = 0;
 }
 
 void encoder_context_destroy(struct encoder_context *ec)
@@ -781,8 +809,9 @@ void encoder_context_destroy(struct encoder_context *ec)
 		}
 
 		if (ec->streaming) {
-			v4l2_set_stream(ec->video_fd, ec->output_type, false);
-			v4l2_set_stream(ec->video_fd, ec->capture_type, false);
+			int s1 = v4l2_set_stream(ec->video_fd, ec->output_type, false);
+			int s2 = v4l2_set_stream(ec->video_fd, ec->capture_type, false);
+			ENCDBG("DESTROY streamoff out=%d cap=%d\n", s1, s2);
 		}
 
 		for (i = 0; i < ec->output_count; i++)
@@ -790,8 +819,11 @@ void encoder_context_destroy(struct encoder_context *ec)
 		for (i = 0; i < ec->capture_count; i++)
 			encoder_buffer_teardown(&ec->capture[i]);
 
-		v4l2_request_buffers(ec->video_fd, ec->output_type, 0);
-		v4l2_request_buffers(ec->video_fd, ec->capture_type, 0);
+		{
+			int r1 = v4l2_request_buffers(ec->video_fd, ec->output_type, 0);
+			int r2 = v4l2_request_buffers(ec->video_fd, ec->capture_type, 0);
+			ENCDBG("DESTROY reqbufs0 out=%d cap=%d\n", r1, r2);
+		}
 	}
 
 	free(ec);
@@ -1521,10 +1553,12 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 
 	encoder_surface_pull_export(surface_object);
 
-	ENCDBG("begin ctx=%p frame=%llu surface=%u enc=%dx%d data=%p pitch=%u\n",
+	ENCDBG("BEGIN ctx=%p frame=%llu surface=%u enc=%dx%d data=%p pitch=%u idr=%d slice=%u\n",
 	       (void *)ec, ec->frame_count, (unsigned)surface_object->base.id,
 	       surface_object->enc_width, surface_object->enc_height,
-	       surface_object->enc_data, surface_object->enc_pitch);
+	       surface_object->enc_data, surface_object->enc_pitch,
+	       (int)ec->pic.pic_fields.bits.idr_pic_flag,
+	       (unsigned)ec->slice.slice_type);
 
 	/*
 	 * ffmpeg only submits VAEncSequenceParameterBufferType on IDR
@@ -1532,6 +1566,7 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 	 */
 	if (!ec->pic_valid || !ec->slice_valid ||
 	    (ec->pic.pic_fields.bits.idr_pic_flag && !ec->seq_valid)) {
+		ENCDBG("FAIL incomplete seq=%d pic=%d slice=%d idr=%d\n", ec->seq_valid, ec->pic_valid, ec->slice_valid, (int)ec->pic.pic_fields.bits.idr_pic_flag);
 		request_log("encoder: incomplete picture (seq=%d pic=%d slice=%d idr=%d)\n",
 			    ec->seq_valid, ec->pic_valid, ec->slice_valid,
 			    ec->pic.pic_fields.bits.idr_pic_flag);
@@ -1539,6 +1574,7 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 	}
 
 	if (ec->coded_buf == VA_INVALID_ID) {
+		ENCDBG("FAIL no coded_buf\n");
 		request_log("encoder: no VAEncCodedBufferType buffer for picture\n");
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 	}
@@ -1549,9 +1585,24 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
 	if (surface_object->enc_data == NULL) {
+		ENCDBG("FAIL no enc_data surface=%u\n", (unsigned)surface_object->base.id);
 		request_log("encoder: input surface %u has no uploaded pixels\n",
 			    (unsigned int)surface_object->base.id);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	/*
+	 * A P/B picture with no preceding reference (the first picture of a
+	 * freshly created context) cannot be encoded: the hardware would
+	 * wait forever for a reference buffer.  Promote it to an IDR so the
+	 * stream stays self-contained and the application does not hang.
+	 */
+	if (!ec->pic.pic_fields.bits.idr_pic_flag && ec->last_ts == 0 &&
+	    (ec->slice.slice_type % 5) != 2) {
+		ENCDBG("promote first non-I picture to IDR (slice=%u)\n",
+		       (unsigned)ec->slice.slice_type);
+		ec->pic.pic_fields.bits.idr_pic_flag = 1;
+		ec->slice.slice_type = 7;
 	}
 
 	/*
@@ -1563,7 +1614,8 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 		sps_size = encoder_build_sps(ec, sps, sizeof(sps));
 		pps_size = encoder_build_pps(ec, pps, sizeof(pps));
 		if (sps_size == 0 || pps_size == 0) {
-			request_log("encoder: SPS/PPS serialisation failed\n");
+			ENCDBG("FAIL sps/pps serialisation\n");
+		request_log("encoder: SPS/PPS serialisation failed\n");
 			return VA_STATUS_ERROR_OPERATION_FAILED;
 		}
 	}
@@ -1578,6 +1630,7 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 
 	rc = encoder_copy_surface(ec, surface_object, output);
 	if (rc < 0) {
+		ENCDBG("FAIL copy surface\n");
 		request_log("encoder: failed to copy input surface\n");
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 	}
@@ -1606,16 +1659,20 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 					   ec->output_type, output->index,
 					   ec->output_planes_count,
 					   output_bytesused, timestamp);
-	if (rc < 0)
+	if (rc < 0) {
+		ENCDBG("FAIL qbuf out rc=%d\n", rc);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
 
 	/* 2. CAPTURE, no request fd (request ownership is on OUTPUT). */
 	capture_bytesused[0] = 0;
 	rc = v4l2_queue_buffer_timestamped(ec->video_fd, -1, ec->capture_type,
 					   capture->index, 1,
 					   capture_bytesused, 0);
-	if (rc < 0)
+	if (rc < 0) {
+		ENCDBG("FAIL qbuf cap rc=%d\n", rc);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
 
 	/* 3. Controls on the request. */
 	memset(controls, 0, sizeof(controls));
@@ -1627,13 +1684,17 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 	controls[1].size = sizeof(ec->rc);
 
 	rc = v4l2_set_controls(ec->video_fd, output->request_fd, controls, 2);
-	if (rc < 0)
+	if (rc < 0) {
+		ENCDBG("FAIL set controls rc=%d\n", rc);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
 
 	/* 4. Queue and wait. */
 	rc = media_request_queue(output->request_fd);
-	if (rc < 0)
+	if (rc < 0) {
+		ENCDBG("FAIL media_request_queue rc=%d\n", rc);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
 
 	ec->has_pending = true;
 	ec->pending_request_fd = output->request_fd;
@@ -1651,6 +1712,7 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 		unsigned int diag_used[2] = { 0, 0 };
 		int rc2;
 
+		ENCDBG("FAIL wait timeout ts=%llu\n", (unsigned long long)timestamp);
 		request_log("encoder: request completion failed (ts=%llu)\n",
 			    (unsigned long long)timestamp);
 
@@ -1693,8 +1755,10 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 	rc = v4l2_dequeue_buffer_info(ec->video_fd, ec->output_type,
 				      output->index, ec->output_planes_count,
 				      NULL, NULL);
-	if (rc < 0)
+	if (rc < 0) {
+		ENCDBG("FAIL dq out rc=%d\n", rc);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
 
 	rc = v4l2_dequeue_buffer_info(ec->video_fd, ec->capture_type,
 				      capture->index, 1, capture_bytesused,
@@ -1714,7 +1778,7 @@ got_payload:
 	/* 6. Assemble the access unit in the VA coded buffer. */
 	payload_size = capture_bytesused[0];
 
-	ENCDBG("end  frame=%llu surface=%u idr=%d slice=%u qp=%u payload=%u\n",
+	ENCDBG("END   frame=%llu surface=%u idr=%d slice=%u qp=%u payload=%u\n",
 	       ec->frame_count, (unsigned)surface_object->base.id,
 	       ec->pic.pic_fields.bits.idr_pic_flag,
 	       (unsigned)ec->slice.slice_type, ec->rc.qp, payload_size);
@@ -1772,6 +1836,7 @@ got_payload:
 	total = header_size + sps_size + pps_size + payload_size;
 
 	if (coded_object->size < total) {
+		ENCDBG("FAIL coded buffer small %u < %u\n", coded_object->size, total);
 		request_log("encoder: coded buffer too small (%u < %u: "
 			    "sps %u pps %u slice %u)\n",
 			    coded_object->size, total, sps_size, pps_size,

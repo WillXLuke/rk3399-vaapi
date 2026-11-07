@@ -294,3 +294,28 @@ both buffers) before releasing the queues, and a timed-out encode gets one
 extra wait so the hantro watchdog can finish before the buffers are touched.
 Stale DMA-BUF mirrors are dropped whenever the surface storage is
 reallocated, so a resolution change can no longer overrun the new buffer.
+
+## Update: in-process encoder re-initialisation (framerate / quality changes)
+
+Tearing the V4L2 encoder session down on `vaDestroyContext` left the hantro
+instance unable to complete requests in the next session: the job was queued
+but never ran, `vaEndPicture` timed out, and ffmpeg then hit
+`Assertion pic->nb_dpb_pics < 16 failed at libavcodec/hw_base_encode.c:61`
+and aborted the whole process. That is what crashed KasmVNC when its frame
+rate was changed (and what broke Sunshine's encoder probing).
+
+Fixes:
+
+* the V4L2 session is kept alive across `vaDestroyContext`/`vaCreateContext`
+  and reused when the geometry is unchanged (`driver_data->encoder_spare`);
+* the first picture of a re-created context is promoted to IDR when the
+  application sends a P picture without a reference (the hardware would
+  otherwise wait forever for a reference buffer);
+* the encoder's timestamp counter is no longer reset when a session is
+  reused, keeping V4L2 timestamps monotonic;
+* fixed a crash from an uninitialised `context_object->encoder`.
+
+Verified with a libva test that destroys and re-creates the context every
+four frames (24/24 frames encoded, previously the fifth frame hung), eight
+back-to-back ffmpeg encoder sessions, and the regular profile matrix
+(45.4 dB). `vaExportSurfaceHandle` and decode are unchanged.

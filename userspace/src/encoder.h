@@ -113,6 +113,7 @@ struct encoder_context *encoder_context_create(struct request_data *driver_data,
 					       unsigned int width,
 					       unsigned int height);
 void encoder_context_destroy(struct encoder_context *ec);
+void encoder_context_reset(struct encoder_context *ec);
 
 void encoder_begin_picture(struct request_data *driver_data,
 			   struct object_context *context_object,

@@ -713,6 +713,7 @@ VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
 	driver_data->video_fd_enc = -1;
 	driver_data->media_fd_enc = -1;
 	driver_data->encode_active = false;
+	driver_data->encoder_spare = NULL;
 
 	/*
 	 * iter38: probe BOTH rkvdec and hantro-vpu so a single libva session
@@ -982,6 +983,10 @@ VAStatus RequestTerminate(VADriverContextP context)
 	if (driver_data->media_fd_vpu981 >= 0)
 		close(driver_data->media_fd_vpu981);
 	if (driver_data->video_fd_enc >= 0)
+		if (driver_data->encoder_spare != NULL) {
+			encoder_context_destroy(driver_data->encoder_spare);
+			driver_data->encoder_spare = NULL;
+		}
 		close(driver_data->video_fd_enc);
 	if (driver_data->media_fd_enc >= 0)
 		close(driver_data->media_fd_enc);

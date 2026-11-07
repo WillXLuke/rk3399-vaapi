@@ -148,6 +148,14 @@ struct request_data {
 	bool encode_active;
 
 	/*
+	 * Encoder V4L2 session kept alive across VA context destroy/create
+	 * cycles.  Tearing the session down leaves the hantro instance in a
+	 * state where the next session's requests never complete, so a
+	 * same-resolution re-init (frame rate/quality change) reuses it.
+	 */
+	void *encoder_spare;
+
+	/*
 	 * iter2 (ampere-kernel-decoders campaign) — per-fd probe result
 	 * for the V4L2_CID_STATELESS_HEVC_EXT_SPS_{ST,LT}_RPS controls
 	 * introduced in Linux 7.0 (Casanova VDPU381/VDPU383 series).

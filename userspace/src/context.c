@@ -28,6 +28,8 @@
 #include "config.h"
 #include "encoder.h"
 #include "request.h"
+
+#include <unistd.h>
 #include "surface.h"
 
 #include <errno.h>
@@ -101,9 +103,18 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 	 * per OUTPUT buffer.
 	 */
 	if (config_object->entrypoint == VAEntrypointEncSlice) {
+		/*
+		 * Re-open the encoder device for every context: the hantro
+		 * instance keeps per-file state (queues, streaming, request
+		 * pool), and after a context destroy the previous fd is left
+		 * in a half-reset state where new requests never complete.
+		 */
 		if (driver_data->video_fd_enc < 0) {
-			status = VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
-			goto error;
+			if (encoder_device_probe(&driver_data->video_fd_enc,
+						 &driver_data->media_fd_enc) < 0) {
+				status = VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+				goto error;
+			}
 		}
 
 		id = object_heap_allocate(&driver_data->context_heap);
@@ -124,10 +135,31 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 		context_object->picture_height = picture_height;
 		context_object->flags = flags;
 
-		context_object->encoder = encoder_context_create(
-			driver_data, config_object->profile,
-			(unsigned int)picture_width,
-			(unsigned int)picture_height);
+		context_object->encoder = NULL;
+
+		if (driver_data->encoder_spare != NULL) {
+			struct encoder_context *spare =
+				driver_data->encoder_spare;
+
+			driver_data->encoder_spare = NULL;
+			if (spare->width == (unsigned int)picture_width &&
+			    spare->height == (unsigned int)picture_height) {
+				/* Same geometry: keep the live V4L2 session
+				 * instead of tearing it down and reopening
+				 * (which leaves the encoder unusable). */
+				encoder_context_reset(spare);
+				context_object->encoder = spare;
+			} else {
+				encoder_context_destroy(spare);
+			}
+		}
+
+		if (context_object->encoder == NULL) {
+			context_object->encoder = encoder_context_create(
+				driver_data, config_object->profile,
+				(unsigned int)picture_width,
+				(unsigned int)picture_height);
+		}
 		if (context_object->encoder == NULL) {
 			status = VA_STATUS_ERROR_ALLOCATION_FAILED;
 			goto error;
@@ -796,9 +828,31 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 	 * the decoder-side format cache / pools belong to other sessions.
 	 */
 	if (context_object->encoder != NULL) {
-		encoder_context_destroy(context_object->encoder);
-		context_object->encoder = NULL;
-		driver_data->encode_active = false;
+		/*
+		 * Keep the V4L2 session for the next context when possible:
+		 * tearing it down leaves the hantro instance unable to
+		 * complete new requests, which is what made in-process
+		 * encoder re-initialisation (frame rate/quality changes)
+		 * fail and crash the applications.
+		 */
+		if (driver_data->encoder_spare == NULL) {
+			driver_data->encoder_spare = context_object->encoder;
+			context_object->encoder = NULL;
+			driver_data->encode_active = false;
+		} else {
+			encoder_context_destroy(context_object->encoder);
+			context_object->encoder = NULL;
+			driver_data->encode_active = false;
+
+			if (driver_data->video_fd_enc >= 0) {
+				close(driver_data->video_fd_enc);
+				driver_data->video_fd_enc = -1;
+			}
+			if (driver_data->media_fd_enc >= 0) {
+				close(driver_data->media_fd_enc);
+				driver_data->media_fd_enc = -1;
+			}
+		}
 
 		free(context_object->surfaces_ids);
 		context_object->surfaces_ids = NULL;
