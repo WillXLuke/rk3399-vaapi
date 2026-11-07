@@ -1796,7 +1796,16 @@ VAStatus encoder_end_picture(struct request_data *driver_data,
 					fresh->seq = ec->seq;
 					fresh->pic = ec->pic;
 					fresh->slice = ec->slice;
-					fresh->seq_valid = ec->seq_valid;
+					/*
+					 * The picture parameters were rendered on
+					 * the old context, so carry the "valid"
+					 * flags over as well; the sequence fields
+					 * are needed because the retried picture
+					 * is an IDR that must emit SPS/PPS.
+					 */
+					fresh->seq_valid = true;
+					fresh->pic_valid = true;
+					fresh->slice_valid = true;
 					fresh->coded_buf = ec->coded_buf;
 					fresh->recovery_count = 1;
 					encoder_context_destroy(ec);
