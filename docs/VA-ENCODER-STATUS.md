@@ -319,3 +319,27 @@ Verified with a libva test that destroys and re-creates the context every
 four frames (24/24 frames encoded, previously the fifth frame hung), eight
 back-to-back ffmpeg encoder sessions, and the regular profile matrix
 (45.4 dB). `vaExportSurfaceHandle` and decode are unchanged.
+
+## Update: multiple encoder contexts (the KasmVNC reconfiguration crash)
+
+The encoder device was opened once per libva session and every VA context
+shared that single V4L2 file handle. KasmVNC keeps the old encoder alive
+while it builds the replacement when the frame rate/quality changes, so two
+contexts briefly reconfigure the same file's queues — the second S_FMT /
+REQBUFS clobbers the first, its encode fails, and ffmpeg 7.1 then aborts on
+`Assertion pic->nb_dpb_pics < 16 failed at libavcodec/hw_base_encode.c:61`.
+
+Each encoder context now opens its own V4L2 video and media file handles and
+closes them on destroy; the libva-level session reuse for same-geometry
+re-initialisation is kept.
+
+Verification (`tests/tools/enc-ffmpeg-like`): a libavcodec harness that
+mirrors a screencast encoder (single reused NV12 hw frame, LOW_DELAY,
+async_depth 1, gop 12) and can re-initialise mid-stream. 72 combinations
+(640x480/1280x720/1600x900/1920x1080 x 15/30/60 fps x CQP/CBR/VBR x re-init
+on/off, 150 frames each) pass with no errors, as do two simultaneous encoder
+contexts (previously the second failed at frame 4), the destroy/re-create
+test, the 45.5 dB profile matrix, DMA-BUF export and VAAPI decode.
+
+ICQ and QVBR are rejected by libavcodec at `avcodec_open2` because the driver
+only advertises CQP, CBR, VBR and NONE.

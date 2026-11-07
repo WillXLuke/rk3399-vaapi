@@ -634,8 +634,16 @@ struct encoder_context *encoder_context_create(struct request_data *driver_data,
 	if (ec == NULL)
 		return NULL;
 
-	ec->video_fd = driver_data->video_fd_enc;
-	ec->media_fd = driver_data->media_fd_enc;
+	/*
+	 * Open a private file handle for every encoder context.  The hantro
+	 * instance keeps queues and formats per file, so sharing one fd
+	 * between contexts (which happens while an application reconfigures
+	 * its encoder) corrupts the other session's queues.
+	 */
+	if (encoder_device_probe(&ec->video_fd, &ec->media_fd) < 0) {
+		free(ec);
+		return NULL;
+	}
 	ec->profile = profile;
 	ec->width = width;
 	ec->height = height;
@@ -825,6 +833,11 @@ void encoder_context_destroy(struct encoder_context *ec)
 			ENCDBG("DESTROY reqbufs0 out=%d cap=%d\n", r1, r2);
 		}
 	}
+
+	if (ec->video_fd >= 0)
+		close(ec->video_fd);
+	if (ec->media_fd >= 0)
+		close(ec->media_fd);
 
 	free(ec);
 }

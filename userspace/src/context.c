@@ -109,13 +109,6 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 		 * pool), and after a context destroy the previous fd is left
 		 * in a half-reset state where new requests never complete.
 		 */
-		if (driver_data->video_fd_enc < 0) {
-			if (encoder_device_probe(&driver_data->video_fd_enc,
-						 &driver_data->media_fd_enc) < 0) {
-				status = VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
-				goto error;
-			}
-		}
 
 		id = object_heap_allocate(&driver_data->context_heap);
 		context_object = CONTEXT(driver_data, id);
@@ -843,15 +836,6 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 			encoder_context_destroy(context_object->encoder);
 			context_object->encoder = NULL;
 			driver_data->encode_active = false;
-
-			if (driver_data->video_fd_enc >= 0) {
-				close(driver_data->video_fd_enc);
-				driver_data->video_fd_enc = -1;
-			}
-			if (driver_data->media_fd_enc >= 0) {
-				close(driver_data->media_fd_enc);
-				driver_data->media_fd_enc = -1;
-			}
 		}
 
 		free(context_object->surfaces_ids);
