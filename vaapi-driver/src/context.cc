@@ -45,6 +45,7 @@ extern "C" {
 #include "config.h"
 #include "driver.h"
 #include "h264.h"
+#include "h265.h"
 #include "encoder.h"
 #include "mpeg2.h"
 #include "surface.h"
@@ -60,6 +61,9 @@ std::set<VAProfile> Context::supported_profiles(const std::vector<V4L2M2MDevice>
     std::set<VAProfile> result;
     for (auto&& device : devices) {
         for (auto&& profile : MPEG2Context::supported_profiles(device)) {
+            result.insert(profile);
+        }
+        for (auto&& profile : H265Context::supported_profiles(device)) {
             result.insert(profile);
         }
         for (auto&& profile : H264Context::supported_profiles(device)) {
@@ -91,6 +95,9 @@ Context* Context::create(DriverData* driver_data, VAProfile profile, VAEntrypoin
     for (auto&& device : driver_data->devices) {
         if (MPEG2Context::supported_profiles(device).contains(profile)) {
             return new MPEG2Context(driver_data, device, picture_width, picture_height, surface_ids);
+        }
+        if (H265Context::supported_profiles(device).contains(profile)) {
+            return new H265Context(driver_data, device, picture_width, picture_height, surface_ids);
         }
         if (H264Context::supported_profiles(device).contains(profile)) {
             return new H264Context(driver_data, device, profile, picture_width, picture_height, surface_ids);

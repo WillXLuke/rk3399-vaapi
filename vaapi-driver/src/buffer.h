@@ -41,6 +41,9 @@ struct Buffer {
     VABufferType type;
     unsigned count;
     std::unique_ptr<uint8_t> data;
+    // When set, the buffer maps straight onto memory the driver already owns
+    // (a surface's host frame) instead of its own allocation.
+    uint8_t* alias = nullptr;
     unsigned int size;
     VASurfaceID derived_surface_id;
     VABufferInfo info;

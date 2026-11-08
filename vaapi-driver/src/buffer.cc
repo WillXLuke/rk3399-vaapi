@@ -139,7 +139,8 @@ VAStatus mapBuffer(VADriverContextP context, VABufferID buffer_id, void** data_m
     }
 
     /* Our buffers are always mapped. */
-    *data_map = driver_data->buffers.at(buffer_id).data.get();
+    const auto& buffer = driver_data->buffers.at(buffer_id);
+    *data_map = buffer.alias ? buffer.alias : buffer.data.get();
 
     return VA_STATUS_SUCCESS;
 }

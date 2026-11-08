@@ -35,6 +35,7 @@ extern "C" {
 #include <linux/videodev2.h>
 
 #include <va/va_backend.h>
+#include <va/va_dec_hevc.h>
 }
 
 #include "context.h"
@@ -79,6 +80,13 @@ struct Surface {
             VASliceParameterBufferVP9* slice;
         } vp9;
     } params;
+
+    // HEVC keeps its per-picture state outside the union above: a picture
+    // carries a list of slices, which cannot live in a union.
+    VAPictureParameterBufferHEVC* h265_picture = nullptr;
+    VAIQMatrixBufferHEVC* h265_iqmatrix = nullptr;
+    std::vector<VASliceParameterBufferHEVC*> h265_slices;
+    std::vector<size_t> h265_slice_offsets;
 
     int request_fd;
     bool capture_done = false;

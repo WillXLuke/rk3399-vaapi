@@ -4,6 +4,10 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#include <ctime>
 #include <stdexcept>
 
 extern "C" {
@@ -300,7 +304,15 @@ VAStatus H264EncContext::encode(VASurfaceID surface_id)
         const uint8_t* uv = surface.host.data() + picture_width * surface.height + y * picture_width;
         uint8_t* u = oplanes[1].data() + y * (picture_width / 2);
         uint8_t* v = oplanes[2].data() + y * (picture_width / 2);
-        for (unsigned x = 0; x < picture_width / 2; x++) {
+        unsigned n = picture_width / 2;
+#if defined(__aarch64__)
+        for (; n >= 8; n -= 8, uv += 16, u += 8, v += 8) {
+            uint8x8x2_t d = vld2_u8(uv);
+            vst1_u8(u, d.val[0]);
+            vst1_u8(v, d.val[1]);
+        }
+#endif
+        for (unsigned x = 0; x < n; x++) {
             u[x] = uv[2 * x];
             v[x] = uv[2 * x + 1];
         }

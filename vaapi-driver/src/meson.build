@@ -35,6 +35,7 @@ sources = [
 	'v4l2.cc',
 	'mpeg2.cc',
 	'h264.cc',
+	'h265.cc',
 	'vp8.cc',
 	'encoder.cc',
 ]
@@ -54,6 +55,7 @@ headers = [
 	'v4l2.h',
 	'mpeg2.h',
 	'h264.h',
+	'h265.h',
 	'vp8.h',
 ]
 cpp_args = [

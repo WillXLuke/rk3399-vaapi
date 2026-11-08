@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <ctime>
 #include <va/va.h>
 
 extern "C" {
@@ -171,6 +172,43 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     auto& surface = driver_data->surfaces.at(surface_id);
+
+    // A packed RGB surface is host-only storage: hand the caller an image that
+    // maps straight onto it, so a frame upload writes the surface in place
+    // instead of being copied through a separate image buffer.
+    if (surface.format == VA_RT_FORMAT_RGB32) {
+        const size_t bytes = static_cast<size_t>(surface.width) * surface.height * 4;
+        if (surface.host.size() != bytes) {
+            surface.host.assign(bytes, 0);
+        }
+        memset(image, 0, sizeof(*image));
+        image->format.fourcc = surface.host_fourcc ? surface.host_fourcc : VA_FOURCC_BGRA;
+        image->format.byte_order = VA_LSB_FIRST;
+        image->format.bits_per_pixel = 32;
+        image->width = surface.width;
+        image->height = surface.height;
+        image->num_planes = 1;
+        image->pitches[0] = surface.width * 4;
+        image->offsets[0] = 0;
+        image->data_size = bytes;
+
+        std::lock_guard<std::mutex> guard(driver_data->mutex);
+        VABufferID buf = smallest_free_key(driver_data->buffers);
+        auto [buffer, inserted] = driver_data->buffers.emplace(
+            buf, Buffer(VAImageBufferType, 1, 0, surface_id, false));
+        if (!inserted) {
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        buffer->second.size = bytes;
+        buffer->second.alias = surface.host.data();
+        image->buf = buf;
+        image->image_id = smallest_free_key(driver_data->images);
+        auto [image_it, ok] = driver_data->images.emplace(std::make_pair(image->image_id, *image));
+        if (!ok) {
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        return VA_STATUS_SUCCESS;
+    }
 
     // Attempt to derive image from uninitialized surface
     if (!surface.destination_buffer) {

@@ -36,6 +36,10 @@
 #include <functional>
 #include <system_error>
 #include <cstdlib>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#include <ctime>
 
 extern "C" {
 #include <linux/videodev2.h>
@@ -75,12 +79,13 @@ void host_rgb_to_nv12(Surface& in, Surface& out)
     uint8_t* dst_y = out.host.data();
     uint8_t* dst_uv = dst_y + static_cast<size_t>(ow) * oh;
 
+    const bool same_size = (iw == ow && ih == oh);
     for (unsigned y = 0; y < oh; y++) {
-        const unsigned sy = (iw == ow && ih == oh) ? y : static_cast<unsigned>(static_cast<uint64_t>(y) * ih / oh);
+        const unsigned sy = same_size ? y : static_cast<unsigned>(static_cast<uint64_t>(y) * ih / oh);
         const uint8_t* row = src + static_cast<size_t>(sy) * iw * 4;
         uint8_t* dy = dst_y + static_cast<size_t>(y) * ow;
         for (unsigned x = 0; x < ow; x++) {
-            const unsigned sx = (iw == ow) ? x : static_cast<unsigned>(static_cast<uint64_t>(x) * iw / ow);
+            const unsigned sx = same_size ? x : static_cast<unsigned>(static_cast<uint64_t>(x) * iw / ow);
             const uint8_t* p = row + static_cast<size_t>(sx) * 4;
             const int b = rgba ? p[2] : p[0];
             const int g = p[1];
