@@ -50,10 +50,13 @@ extern "C" {
 #include "v4l2.h"
 
 Buffer::Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id,
-    bool coded)
+    bool coded, bool zero_init)
     : type(type)
     , count(count)
-    , data(static_cast<uint8_t*>(calloc(size * count + (coded ? sizeof(VACodedBufferSegment) : 0), 1)))
+    , data(static_cast<uint8_t*>(zero_init
+              ? calloc(size * count + (coded ? sizeof(VACodedBufferSegment) : 0), 1)
+              : malloc(size * count + (coded ? sizeof(VACodedBufferSegment) : 0))),
+        &free)
     , size(size)
     , derived_surface_id(derived_surface_id)
     , info({ .handle = static_cast<uintptr_t>(-1) })
@@ -98,8 +101,10 @@ VAStatus createBuffer(VADriverContextP context, VAContextID context_id, VABuffer
 
     std::lock_guard<std::mutex> guard(driver_data->mutex);
     *buffer_id = smallest_free_key(driver_data->buffers);
+    // Image buffers are fully overwritten by vaGetImage and can be tens of
+    // megabytes; zeroing them on every vaCreateImage is pure overhead.
     auto [buffer, inserted] = driver_data->buffers.emplace(
-        std::make_pair(*buffer_id, Buffer(type, count, size, VA_INVALID_ID, coded)));
+        std::make_pair(*buffer_id, Buffer(type, count, size, VA_INVALID_ID, coded, type != VAImageBufferType)));
     if (!inserted || !buffer->second.data) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }

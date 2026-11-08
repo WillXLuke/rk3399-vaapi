@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 
 extern "C" {
@@ -36,11 +37,13 @@ extern "C" {
 }
 
 struct Buffer {
-    Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id, bool coded = false);
+    Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id, bool coded = false,
+        bool zero_init = true);
 
     VABufferType type;
     unsigned count;
-    std::unique_ptr<uint8_t> data;
+    // calloc/free, not new/delete: VA image buffers can be tens of megabytes.
+    std::unique_ptr<uint8_t, void (*)(void*)> data;
     // When set, the buffer maps straight onto memory the driver already owns
     // (a surface's host frame) instead of its own allocation.
     uint8_t* alias = nullptr;

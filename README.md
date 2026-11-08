@@ -34,8 +34,8 @@ unpacked from rkvdec's packed NV15 capture buffers.
 ## Install from a release
 
 ```sh
-wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/libva-v4l2-rk3399_1.0.3-1_arm64.deb
-wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/rk3399-vpu-modules-7.3.3-nanopc-t4_1.0.3-1_arm64.deb
+wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/libva-v4l2-rk3399_1.0.4-1_arm64.deb
+wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/rk3399-vpu-modules-7.3.3-nanopc-t4_1.0.4-1_arm64.deb
 sudo dpkg -i ./*.deb
 ```
 
@@ -157,10 +157,43 @@ is built with the GStreamer codec-parser headers.
   than bits; and a new PPS is emitted whenever rate control moves the QP, because
   the VPU2 writes no slice QP delta and a stale `pic_init_qp_minus26` decodes
   every later frame at the wrong QP (soft, flickering, then grey mush).
-* **4K memory budget**: one capture buffer per bound surface, with a 24-buffer
-  floor and 4 MiB compressed-source buffers rather than one raw frame each.
-  The old 32-buffer/raw-size allocation needed about 670 MB at 4K on this 4 GB
-  board; the current one is about 0.5 GB for 10-bit 4K.
+* **4K memory budget**: one capture buffer per bound surface, with a 20-buffer
+  floor (FFmpeg's HEVC pool is 20) and 4 MiB compressed-source buffers rather
+  than one raw frame each.  The old 32-buffer/raw-size allocation needed about
+  670 MB at 4K on this 4 GB board; the current one is about 0.45 GB for 10-bit
+  4K.
+* **Encode latency**: RGB32 uploads are converted to NV12 with NEON inside
+  `vaPutImage`, the VPP hands the frame over with a move, the conversion uses a
+  scoped big-core affinity hint, and the luma plane reaches the V4L2 buffer in
+  one memcpy.  See "Encoding latency" below.
+
+## Encoding latency
+
+pixelflux/Selkies is the real consumer: it captures the X11 desktop as RGBA,
+uploads it to an RGB32 surface, asks the VA video processor for NV12, and then
+runs the VPU2 H.264 encoder.  Median `encode_start -> encode_end` for 720p live
+desktop over ~240 frames:
+
+| Version / path | 720p encode latency |
+| --- | --- |
+| 1.0.3, scalar RGB32->NV12 | 24.2 ms |
+| 1.0.4, default affinity | **17.4-17.9 ms** |
+| 1.0.4, consumer pinned to A72 (`taskset -c 4,5`) | **15.4 ms** |
+
+Pure NV12 encoding (no RGB conversion) is 12.4-13.5 ms/frame at 720p
+(74-81 fps) and 23.2 ms at 1080p (43 fps), so the remaining latency is mostly
+the fixed ~9-10 ms VPU2 job plus the upload/copy budget.  The 1.0.4 changes are:
+
+1. a same-size NEON BT.709-limited RGB32->NV12 kernel (two `vld4` loads per 16
+   pixels, point-sampled chroma, scalar fallback for scaling);
+2. conversion in `vaPutImage` instead of the later VPP pass, so the RGBA frame
+   is never copied into a staging vector;
+3. a VPP handoff by move rather than copy;
+4. a scoped big-core affinity hint for the conversion (it respects a caller
+   that is already pinned to the little cores);
+5. a single luma-plane memcpy into the V4L2 output buffer;
+6. an allocator fix: image buffers were `calloc`-allocated but released with
+   `delete`, and 25 MB was zeroed for every 4K P010 `vaCreateImage`.
 
 ## Performance and limits
 
@@ -170,8 +203,12 @@ Measured on the NanoPC-T4 (4 GB), kernel 7.3.3, mainline `rkvdec`:
 | --- | --- | --- |
 | Decode | HEVC Main10, 3840x2160@59.94, 32.53 s (1950 frames) | **62.4 fps end-to-end** with the CPU governor at `performance`; 57.7-60.5 fps with `ondemand` under load. All frames decoded, no buffer errors |
 | Decode | HEVC Main10, 3840x2160@59.94, 6.5 s (390 frames) | P010 output **bit-exact** against FFmpeg software decode |
-| Decode | HEVC Main, 1280x720@30, 5 s (150 frames) | **340 fps**, bit-exact against software decode |
-| Decode | HEVC Main10 download to P010 | ~5.7 fps, CPU-bound by the scalar NV15->P010 unpack; decode-to-null is unaffected |
+| Decode | HEVC Main, 1280x720@30, 5 s (150 frames) | **295-305 fps**, bit-exact against software decode |
+| Decode | HEVC Main10, 3840x2160@59.94, 5 s | 50.5 fps ondemand, 54.2 fps performance governor |
+| Decode | HEVC Main10 download to P010 | ~5.7 fps; the rkvdec capture buffer is uncached DMA memory (164 ms/frame read), not the unpack math |
+| Encode | H.264 VA-API, 1280x720@30, 5 s from the uploaded clip | 150 frames, 73.9-80.6 fps, 12.4-13.5 ms/frame |
+| Encode | H.264 VA-API, pixelflux 720p live desktop | 17.4-17.9 ms/frame default, 15.4 ms pinned to A72 (was 24.2 ms) |
+| Encode | H.264 VA-API, 1920x1080@30 | 43 fps, 23.2 ms/frame |
 | Decode | H.264, 3840x2160 | 80.8 fps (GStreamer `v4l2slh264dec`) |
 | Decode | VP9 Profile 0, 3840x2160 | 4.8 fps - CPU-bound, see below |
 | Decode | VP8 1080p / MPEG-2 1080p | 75.9 fps / 181.8 fps (hantro) |
@@ -220,9 +257,16 @@ and are included for comparison with the kernel driver's capability.
 | Decode | H.264 | 3840x2160 | 80.8 fps (GStreamer) |
 | Decode | HEVC Main10 | 3840x2160, 10-bit | 87.4 fps (GStreamer) |
 | Encode | H.264 High | 1920x1080, 600 frames | 40 fps sustained |
+| Encode | H.264 VA-API | 1280x720@30, 5 s / 150 frames | 73.9-80.6 fps, 150/150 frames |
+| Encode | H.264 VA-API | pixelflux 720p live, 241 frames | 17.4-17.9 ms/frame, 15.4 ms pinned |
 
 The 32.53 s test stream is the uploaded 6.5 s 4K60 Main10 clip looped five times
-with `-c copy`; it is 1950 frames at 3840x2160, 59.94 fps.
+with `-c copy`; it is 1950 frames at 3840x2160, 59.94 fps.  The 5 s encode
+source is a 1280x720@30 yuv420p derivative of the same uploaded clip; the
+encoder benchmark uses the raw frames so RGB capture is excluded.  Full
+before/after numbers and the research trail are in
+[`OPTIMIZATION_RESULTS.md`](https://github.com/WillXLuke/rk3399-vaapi/blob/main/OPTIMIZATION_RESULTS.md)
+and [`OPTIMIZATION_RESEARCH.md`](https://github.com/WillXLuke/rk3399-vaapi/blob/main/OPTIMIZATION_RESEARCH.md).
 
 ## Licence
 

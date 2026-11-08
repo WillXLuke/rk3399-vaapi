@@ -41,6 +41,7 @@ extern "C" {
 #include "buffer.h"
 #include "driver.h"
 #include "format.h"
+#include "picture.h"
 #include "surface.h"
 #include "utils.h"
 #include "v4l2.h"
@@ -211,7 +212,6 @@ VAStatus createImage(VADriverContextP context, VAImageFormat* format, int width,
     if (!inserted) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
-
     return VA_STATUS_SUCCESS;
 }
 
@@ -376,13 +376,15 @@ VAStatus putImage(VADriverContextP context, VASurfaceID surface_id, VAImageID im
     const unsigned h = surface.height;
 
     if (image.format.fourcc == VA_FOURCC_RGBA || image.format.fourcc == VA_FOURCC_BGRA) {
-        surface.host.resize(static_cast<size_t>(w) * h * 4);
-        surface.host_fourcc = image.format.fourcc;
-        for (unsigned y = 0; y < h; y++) {
-            const uint8_t* src = buf.data.get() + image.offsets[0] + static_cast<size_t>(y) * image.pitches[0];
-            const unsigned copy_w = std::min<unsigned>(w * 4, image.pitches[0]);
-            std::copy_n(src, copy_w, surface.host.data() + static_cast<size_t>(y) * w * 4);
-        }
+        // Convert while the upload image is still the source: the encoder's
+        // video processor only needs NV12, so storing RGBA and converting it
+        // again in vaEndPicture would copy the frame twice.
+        surface.host.resize(static_cast<size_t>(w) * h * 3 / 2);
+        const unsigned src_pitch = image.pitches[0] ? image.pitches[0] : w * 4;
+        rgb_to_nv12(buf.data.get() + image.offsets[0], image.width ? image.width : w,
+            image.height ? image.height : h, src_pitch, image.format.fourcc == VA_FOURCC_RGBA,
+            surface.host.data(), w, h);
+        surface.host_fourcc = VA_FOURCC_NV12;
         return VA_STATUS_SUCCESS;
     }
 

@@ -296,10 +296,15 @@ VAStatus H264EncContext::encode(VASurfaceID surface_id)
         return VA_STATUS_ERROR_OPERATION_FAILED;
     const unsigned src_h = std::min<unsigned>(surface.height, picture_height);
     const unsigned src_ch = std::min<unsigned>(surface.height / 2, picture_height / 2);
-    for (unsigned y = 0; y < src_h; y++)
-        std::memcpy(oplanes[0].data() + y * picture_width, surface.host.data() + y * picture_width, picture_width);
-    for (unsigned y = src_h; y < static_cast<unsigned>(picture_height); y++)
-        std::memset(oplanes[0].data() + y * picture_width, 0, picture_width);
+    if (src_h == static_cast<unsigned>(picture_height))
+        std::memcpy(oplanes[0].data(), surface.host.data(),
+            static_cast<size_t>(picture_width) * picture_height);
+    else {
+        for (unsigned y = 0; y < src_h; y++)
+            std::memcpy(oplanes[0].data() + y * picture_width, surface.host.data() + y * picture_width, picture_width);
+        for (unsigned y = src_h; y < static_cast<unsigned>(picture_height); y++)
+            std::memset(oplanes[0].data() + y * picture_width, 0, picture_width);
+    }
     for (unsigned y = 0; y < src_ch; y++) {
         const uint8_t* uv = surface.host.data() + picture_width * surface.height + y * picture_width;
         uint8_t* u = oplanes[1].data() + y * (picture_width / 2);

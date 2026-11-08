@@ -27,9 +27,16 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 extern "C" {
 #include <va/va_backend.h>
 }
+
+// Packed RGBA/BGRA to NV12, BT.709 limited range, point-sampled chroma.
+void rgb_to_nv12(const uint8_t* src, unsigned iw, unsigned ih, size_t src_pitch, bool rgba, uint8_t* dst,
+    unsigned ow, unsigned oh);
 
 VAStatus beginPicture(VADriverContextP va_context, VAContextID context_id, VASurfaceID surface_id);
 VAStatus renderPicture(VADriverContextP va_context, VAContextID context_id, VABufferID* buffers, int buffers_count);

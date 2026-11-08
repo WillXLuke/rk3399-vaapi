@@ -1,3 +1,21 @@
+libva-v4l2-rk3399 (1.0.4-1) unstable; urgency=medium
+
+  * Encode latency: convert RGB32 uploads to NV12 with NEON inside
+    vaPutImage, hand the VPP an NV12 frame by move instead of copying RGBA,
+    add a scoped big-core affinity hint for the conversion, and copy the luma
+    plane into the V4L2 buffer in one memcpy.  pixelflux 720p live encode goes
+    from 24.2 ms to 17.4-17.9 ms (15.4 ms with the consumer pinned to A72).
+  * Fix the image buffer allocator: calloc memory was released with delete and
+    every 4K P010 vaCreateImage zeroed 25 MB.  Image buffers now use malloc/free
+    and are not pre-zeroed.
+  * Decoder setup uses 20 capture buffers instead of 24 (about 90 MB less at
+    4K10) while covering FFmpeg's 20-surface pool.
+  * Validation: 5 s 720p30 encode at 73.9-80.6 fps; 5 s 4K60 Main10 decode at
+    50.5 fps ondemand / 54.2 fps with the performance governor; 720p HEVC at
+    ~300 fps and still bit-exact.
+
+ -- William Luke <126307463+WillXLuke@users.noreply.github.com>  Sun, 08 Nov 2026 20:20:00 +0800
+
 libva-v4l2-rk3399 (1.0.3-1) unstable; urgency=medium
 
   * HEVC Main and Main10 decode exposed through VA-API: map the VA picture

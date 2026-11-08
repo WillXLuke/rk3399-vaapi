@@ -140,9 +140,10 @@ void Context::initialize_surfaces(std::span<VASurfaceID> surface_ids)
         throw std::invalid_argument("No surfaces to be created");
 
     // Applications create surfaces lazily, so the initial span can be smaller
-    // than the pool they eventually bind.  FFmpeg's HEVC decoder ends up with
-    // 20 surfaces for a 4:2:0 stream; keep a little headroom above that.
-    num_buffers = std::max<unsigned>(surface_ids.size(), 24);
+    // than the pool they eventually bind.  FFmpeg's HEVC decoder allocates 20
+    // surfaces for a 4:2:0 stream; 20 buffers covers it and cuts 4K10 setup
+    // memory by about 90 MB.
+    num_buffers = std::max<unsigned>(surface_ids.size(), 20);
 
     /* The Rockchip driver initializes its internal image format from the
      * current SPS control and refuses to change it once buffers are
