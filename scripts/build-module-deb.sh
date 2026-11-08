@@ -1,19 +1,21 @@
 #!/bin/sh
-# Package the patched hantro-vpu.ko for the kernel it was built against.
+# Package the patched hantro-vpu.ko and the rkvdec module for the kernel they
+# were built against.
 #
-#   ./scripts/build-module-deb.sh <path-to-hantro-vpu.ko> [output-dir]
+#   ./scripts/build-module-deb.sh <hantro-vpu.ko> <rockchip-vdec.ko> [output-dir]
 set -eu
 
-KO=${1:?usage: $0 <hantro-vpu.ko> [output-dir]}
-OUT=${2:-.}
-VER=1.0.0
-KVER=$(modinfo -F vermagic "$KO" | awk '{print $1}')
-PKG=hantro-vpu-rk3399-modules-${KVER}
+[ $# -ge 2 ] || { echo "usage: $0 <hantro-vpu.ko> <rockchip-vdec.ko> [output-dir]" >&2; exit 1; }
+OUT=${3:-.}
+VER=1.0.1
+KVER=$(modinfo -F vermagic "$1" | awk '{print $1}')
+PKG=rk3399-vpu-modules-${KVER}
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$STAGE/DEBIAN" "$STAGE/lib/modules/$KVER/updates"
-install -m644 "$KO" "$STAGE/lib/modules/$KVER/updates/hantro-vpu.ko"
+install -m644 "$1" "$STAGE/lib/modules/$KVER/updates/hantro-vpu.ko"
+install -m644 "$2" "$STAGE/lib/modules/$KVER/updates/rockchip-vdec.ko"
 
 cat > "$STAGE/DEBIAN/control" <<CTL
 Package: $PKG
@@ -23,9 +25,12 @@ Maintainer: William Luke <126307463+WillXLuke@users.noreply.github.com>
 Section: kernel
 Priority: optional
 Homepage: https://github.com/WillXLuke/rk3399-vaapi
-Description: RK3399 VPU2 H.264 encoder module for Linux $KVER
- Patched hantro/verisilicon driver adding H.264 encoding on the RK3399 VPU2,
- built against Linux $KVER. Install it alongside libva-v4l2-rk3399.
+Conflicts: hantro-vpu-rk3399-modules-$KVER
+Replaces: hantro-vpu-rk3399-modules-$KVER
+Description: RK3399 VPU modules: H.264 encoder and RKVDU decoder for Linux $KVER
+ Patched verisilicon/hantro driver, adding H.264 encoding on the RK3399 VPU2
+ and fixing the JPEG encoder's size limit to the hardware's 8176x8176, plus
+ the rkvdec driver for H.264/HEVC/VP9 decoding. Built against Linux $KVER.
 CTL
 
 cat > "$STAGE/DEBIAN/postinst" <<'POST'

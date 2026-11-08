@@ -24,13 +24,14 @@ register block (including the encoder's rate-control inputs) passed through
 ## Install from a release
 
 ```sh
-wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/libva-v4l2-rk3399_1.0.0-1_arm64.deb
-wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/hantro-vpu-rk3399-modules-7.3.3-nanopc-t4_1.0.0-1_arm64.deb
+wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/libva-v4l2-rk3399_1.0.1-1_arm64.deb
+wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/rk3399-vpu-modules-7.3.3-nanopc-t4_1.0.1-1_arm64.deb
 sudo dpkg -i ./*.deb
 ```
 
-The module package is tied to the kernel it was built against (7.3.3-nanopc-t4);
-on another kernel use the patch and build it yourself. After installing the
+The module package carries both `hantro-vpu.ko` (encoder) and `rockchip-vdec.ko`
+(decoder) and is tied to the kernel it was built against (7.3.3-nanopc-t4); on
+another kernel use the patch and build them yourself. After installing the
 driver, `LIBVA_DRIVER_NAME=v4l2 vainfo` should list `VAEntrypointEncSlice`.
 
 ## Build
@@ -128,6 +129,41 @@ Measured on the NanoPC-T4 (4 GB):
 * Quality per bit is below x264; a dense 720p desktop needs roughly 8-16 Mbps to
   stay sharp.
 * The SPS carries no VUI, so players assume HD = BT.709 limited.
+
+## Validation
+
+Measured on a NanoPC-T4, kernel 7.3.3, 10 s test clips (300 frames each) decoded
+through the kernel's stateless V4L2 decoders with GStreamer `v4l2codecs`, and
+encoded through this VA-API driver with FFmpeg:
+
+| Direction | Codec | Content | Result |
+| --- | --- | --- | --- |
+| Decode | H.264 | 3840x2160 | 80.8 fps (rkvdec) |
+| Decode | HEVC Main10 | 3840x2160, 10-bit | 87.4 fps (rkvdec) |
+| Decode | VP9 Profile 0 | 3840x2160 | 4.8 fps — CPU-bound, see below |
+| Decode | VP8 | 1920x1080 | 75.9 fps (hantro) |
+| Decode | MPEG-2 | 1920x1080 | 181.8 fps (hantro) |
+| Decode | JPEG | up to 8176x8176 | no decoder driver in mainline |
+| Decode | MPEG-4, VC-1 | 1080p | no driver in mainline |
+| Encode | H.264 High | 1920x1080, 600 frames | 40 fps sustained (~26 Mbps at QP floor) |
+| Encode | JPEG | 8176x8176 | 2.7 MB image, works |
+| Encode | VP8 | 1080p | no VP8 encoder in the VPU2 driver |
+
+Notes:
+
+* **HEVC and VP9 are not exposed through VA-API yet.** `libva-v4l2` carries no
+  HEVC backend, and its VP9 backend is only compiled when the GStreamer codec
+  parsers headers are present. The kernel decoders themselves work (HEVC 87 fps
+  at 4K, measured through GStreamer).
+* **VP9 decode is CPU-bound (~5 fps at 4K, ~12 fps at 1080p)** with all six
+  cores busy, while the same hardware decodes H.264 and HEVC at 80+ fps. The
+  element does select `rkvdec-proc` and NV12, so this is per-frame work in the
+  VP9 path (parser/copies) that needs profiling before the 4K60 claim holds.
+* **JPEG encode tops out at 8176x8176**, not 8192: the VPU2 JPEG block addresses
+  511 macroblocks per row, so a width of 8192 wraps to zero and used to produce
+  a 0x0 JPEG silently. The driver now advertises 8176 and rejects larger sizes.
+* H.264 encode is I/P only with one reference and CAVLC; 40 fps at 1080p is the
+  sustained rate, above the 30 fps the VPU2 is specified for.
 
 ## Licence
 

@@ -1,6 +1,6 @@
 diff -urN a/drivers/media/platform/verisilicon/hantro_drv.c b/drivers/media/platform/verisilicon/hantro_drv.c
---- a/drivers/media/platform/verisilicon/hantro_drv.c	2026-11-08 16:07:51.178101196 +0800
-+++ b/drivers/media/platform/verisilicon/hantro_drv.c	2026-11-08 16:07:51.208998748 +0800
+--- a/drivers/media/platform/verisilicon/hantro_drv.c	2026-11-08 17:42:57.082955655 +0800
++++ b/drivers/media/platform/verisilicon/hantro_drv.c	2026-11-08 17:42:57.715843411 +0800
 @@ -28,6 +28,7 @@
  #include "hantro_v4l2.h"
  #include "hantro.h"
@@ -29,8 +29,8 @@ diff -urN a/drivers/media/platform/verisilicon/hantro_drv.c b/drivers/media/plat
  };
  
 diff -urN a/drivers/media/platform/verisilicon/hantro.h b/drivers/media/platform/verisilicon/hantro.h
---- a/drivers/media/platform/verisilicon/hantro.h	2026-11-08 16:07:51.182327717 +0800
-+++ b/drivers/media/platform/verisilicon/hantro.h	2026-11-08 16:07:51.214012765 +0800
+--- a/drivers/media/platform/verisilicon/hantro.h	2026-11-08 17:42:57.225763965 +0800
++++ b/drivers/media/platform/verisilicon/hantro.h	2026-11-08 17:42:57.953796108 +0800
 @@ -32,6 +32,7 @@
  struct hantro_postproc_ops;
  
@@ -56,8 +56,8 @@ diff -urN a/drivers/media/platform/verisilicon/hantro.h b/drivers/media/platform
  };
  
 diff -urN a/drivers/media/platform/verisilicon/hantro_h1_regs.h b/drivers/media/platform/verisilicon/hantro_h1_regs.h
---- a/drivers/media/platform/verisilicon/hantro_h1_regs.h	2026-11-08 16:07:51.186255280 +0800
-+++ b/drivers/media/platform/verisilicon/hantro_h1_regs.h	2026-11-08 16:07:51.218206035 +0800
+--- a/drivers/media/platform/verisilicon/hantro_h1_regs.h	2026-11-08 17:42:57.255788561 +0800
++++ b/drivers/media/platform/verisilicon/hantro_h1_regs.h	2026-11-08 17:42:57.994705940 +0800
 @@ -23,6 +23,15 @@
  #define     H1_REG_AXI_CTRL_INPUT_SWAP32		BIT(2)
  #define     H1_REG_AXI_CTRL_OUTPUT_SWAP8		BIT(1)
@@ -76,7 +76,7 @@ diff -urN a/drivers/media/platform/verisilicon/hantro_h1_regs.h b/drivers/media/
  #define H1_REG_ADDR_REF_LUMA				0x01c
 diff -urN a/drivers/media/platform/verisilicon/hantro_h264_encode.h b/drivers/media/platform/verisilicon/hantro_h264_encode.h
 --- a/drivers/media/platform/verisilicon/hantro_h264_encode.h	1970-01-01 08:00:00.000000000 +0800
-+++ b/drivers/media/platform/verisilicon/hantro_h264_encode.h	2026-11-08 16:07:51.242553912 +0800
++++ b/drivers/media/platform/verisilicon/hantro_h264_encode.h	2026-11-08 17:42:58.044889849 +0800
 @@ -0,0 +1,45 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -124,8 +124,8 @@ diff -urN a/drivers/media/platform/verisilicon/hantro_h264_encode.h b/drivers/me
 +
 +#endif /* __HANTRO_H264_ENCODE_H__ */
 diff -urN a/drivers/media/platform/verisilicon/hantro_hw.h b/drivers/media/platform/verisilicon/hantro_hw.h
---- a/drivers/media/platform/verisilicon/hantro_hw.h	2026-11-08 16:07:51.189787012 +0800
-+++ b/drivers/media/platform/verisilicon/hantro_hw.h	2026-11-08 16:07:51.222612513 +0800
+--- a/drivers/media/platform/verisilicon/hantro_hw.h	2026-11-08 17:42:57.300010834 +0800
++++ b/drivers/media/platform/verisilicon/hantro_hw.h	2026-11-08 17:42:58.114587909 +0800
 @@ -379,6 +379,18 @@
   * @done:	Read back processing results and additional data from hardware.
   * @reset:	Reset the hardware in case of a timeout.
@@ -156,8 +156,8 @@ diff -urN a/drivers/media/platform/verisilicon/hantro_hw.h b/drivers/media/platf
 +
  #endif /* HANTRO_HW_H_ */
 diff -urN a/drivers/media/platform/verisilicon/hantro_v4l2.c b/drivers/media/platform/verisilicon/hantro_v4l2.c
---- a/drivers/media/platform/verisilicon/hantro_v4l2.c	2026-11-08 16:07:51.194460989 +0800
-+++ b/drivers/media/platform/verisilicon/hantro_v4l2.c	2026-11-08 16:07:51.228213651 +0800
+--- a/drivers/media/platform/verisilicon/hantro_v4l2.c	2026-11-08 17:42:57.373828664 +0800
++++ b/drivers/media/platform/verisilicon/hantro_v4l2.c	2026-11-08 17:42:58.228521075 +0800
 @@ -491,6 +491,9 @@
  	case V4L2_PIX_FMT_JPEG:
  		ctx->fh.m2m_ctx->out_q_ctx.q.requires_requests = false;
@@ -169,8 +169,8 @@ diff -urN a/drivers/media/platform/verisilicon/hantro_v4l2.c b/drivers/media/pla
  	case V4L2_PIX_FMT_VP8_FRAME:
  	case V4L2_PIX_FMT_H264_SLICE:
 diff -urN a/drivers/media/platform/verisilicon/Makefile b/drivers/media/platform/verisilicon/Makefile
---- a/drivers/media/platform/verisilicon/Makefile	2026-11-08 16:07:51.199949836 +0800
-+++ b/drivers/media/platform/verisilicon/Makefile	2026-11-08 16:07:51.233908997 +0800
+--- a/drivers/media/platform/verisilicon/Makefile	2026-11-08 17:42:57.476762262 +0800
++++ b/drivers/media/platform/verisilicon/Makefile	2026-11-08 17:42:58.502115922 +0800
 @@ -29,6 +29,7 @@
  
  hantro-vpu-$(CONFIG_VIDEO_HANTRO_ROCKCHIP) += \
@@ -181,7 +181,7 @@ diff -urN a/drivers/media/platform/verisilicon/Makefile b/drivers/media/platform
  		rockchip_vpu2_hw_vp8_dec.o \
 diff -urN a/drivers/media/platform/verisilicon/rockchip_vpu2_h264_regs.h b/drivers/media/platform/verisilicon/rockchip_vpu2_h264_regs.h
 --- a/drivers/media/platform/verisilicon/rockchip_vpu2_h264_regs.h	1970-01-01 08:00:00.000000000 +0800
-+++ b/drivers/media/platform/verisilicon/rockchip_vpu2_h264_regs.h	2026-11-08 16:07:51.247266971 +0800
++++ b/drivers/media/platform/verisilicon/rockchip_vpu2_h264_regs.h	2026-11-08 17:42:58.636114777 +0800
 @@ -0,0 +1,601 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
@@ -786,7 +786,7 @@ diff -urN a/drivers/media/platform/verisilicon/rockchip_vpu2_h264_regs.h b/drive
 +#endif /* RK3399_VPU_REGS_H_ */
 diff -urN a/drivers/media/platform/verisilicon/rockchip_vpu2_hw_h264_enc.c b/drivers/media/platform/verisilicon/rockchip_vpu2_hw_h264_enc.c
 --- a/drivers/media/platform/verisilicon/rockchip_vpu2_hw_h264_enc.c	1970-01-01 08:00:00.000000000 +0800
-+++ b/drivers/media/platform/verisilicon/rockchip_vpu2_hw_h264_enc.c	2026-11-08 16:07:51.251533741 +0800
++++ b/drivers/media/platform/verisilicon/rockchip_vpu2_hw_h264_enc.c	2026-11-08 17:42:58.675942240 +0800
 @@ -0,0 +1,1207 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
@@ -1996,12 +1996,21 @@ diff -urN a/drivers/media/platform/verisilicon/rockchip_vpu2_hw_h264_enc.c b/dri
 +	vb2_set_plane_payload(&dst_buf->vb2_buf, 0, slice_size);
 +}
 diff -urN a/drivers/media/platform/verisilicon/rockchip_vpu_hw.c b/drivers/media/platform/verisilicon/rockchip_vpu_hw.c
---- a/drivers/media/platform/verisilicon/rockchip_vpu_hw.c	2026-11-08 16:07:51.204623187 +0800
-+++ b/drivers/media/platform/verisilicon/rockchip_vpu_hw.c	2026-11-08 16:07:51.238178684 +0800
-@@ -59,6 +59,19 @@
- 			.step_height = MB_DIM,
- 		},
- 	},
+--- a/drivers/media/platform/verisilicon/rockchip_vpu_hw.c	2026-11-08 17:42:57.653788146 +0800
++++ b/drivers/media/platform/verisilicon/rockchip_vpu_hw.c	2026-11-08 17:42:58.830540906 +0800
+@@ -52,10 +52,23 @@
+ 		.header_size = JPEG_HEADER_SIZE,
+ 		.frmsize = {
+ 			.min_width = 96,
+-			.max_width = 8192,
++			.max_width = 8176,
+ 			.step_width = MB_DIM,
+ 			.min_height = 32,
+-			.max_height = 8192,
++			.max_height = 8176,
++			.step_height = MB_DIM,
++		},
++	},
 +	{
 +		.fourcc = V4L2_PIX_FMT_H264,
 +		.codec_mode = HANTRO_MODE_H264_ENC,
@@ -2012,12 +2021,9 @@ diff -urN a/drivers/media/platform/verisilicon/rockchip_vpu_hw.c b/drivers/media
 +			.step_width = MB_DIM,
 +			.min_height = 32,
 +			.max_height = 1088,
-+			.step_height = MB_DIM,
-+		},
-+	},
- };
- 
- static const struct hantro_fmt rockchip_vpu1_postproc_fmts[] = {
+ 			.step_height = MB_DIM,
+ 		},
+ 	},
 @@ -577,6 +590,13 @@
  		.reset = rockchip_vpu2_enc_reset,
  		.done = rockchip_vpu2_jpeg_enc_done,
