@@ -1,0 +1,5 @@
+The kernel patch in patches/ is licensed GPL-2.0, like the Linux kernel tree it
+applies to.
+
+The VA-API driver in vaapi-driver/ is libva-v4l2, MIT licensed; see
+vaapi-driver/COPYING and vaapi-driver/COPYING.MIT.
