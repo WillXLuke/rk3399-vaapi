@@ -50,11 +50,16 @@ v4l2-ctl -d /dev/videoN --list-formats        # [1]: 'H264'
 ### 2. VA-API driver
 
 ```sh
+./scripts/build-vaapi-driver.sh --install
+# or by hand:
 cd vaapi-driver
-meson setup build --buildtype=release
+CC=gcc-14 CXX=g++-14 meson setup build --buildtype=release
 ninja -C build
 sudo cp build/src/v4l2_drv_video.so /usr/lib/aarch64-linux-gnu/dri/
 ```
+
+GCC 15 on this board ICEs with `internal compiler error: Illegal instruction`;
+gcc-14 builds it cleanly, which is why the script prefers it when present.
 
 The driver replaces the stock `v4l2_drv_video.so` and is selected with
 `LIBVA_DRIVER_NAME=v4l2` (or by pointing `panfrost_drv_video.so` at it, which is
