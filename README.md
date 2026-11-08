@@ -21,6 +21,18 @@ The patch here is that work rebased onto 7.3.3, with the private per-frame
 register block (including the encoder's rate-control inputs) passed through
 `V4L2_CID_HANTRO_H264_ENCODE_PARAMS`.
 
+## Install from a release
+
+```sh
+wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/libva-v4l2-rk3399_1.0.0-1_arm64.deb
+wget https://github.com/WillXLuke/rk3399-vaapi/releases/latest/download/hantro-vpu-rk3399-modules-7.3.3-nanopc-t4_1.0.0-1_arm64.deb
+sudo dpkg -i ./*.deb
+```
+
+The module package is tied to the kernel it was built against (7.3.3-nanopc-t4);
+on another kernel use the patch and build it yourself. After installing the
+driver, `LIBVA_DRIVER_NAME=v4l2 vainfo` should list `VAEntrypointEncSlice`.
+
 ## Build
 
 ### 1. Kernel modules

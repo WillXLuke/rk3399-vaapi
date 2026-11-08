@@ -1,0 +1,6 @@
+libva-v4l2-rk3399 (1.0.0-1) unstable; urgency=medium
+
+  * Initial release: V4L2-backed VA-API driver with RK3399 H.264 encode,
+    RKVDU decode, the CPU video processor, and fixed rate control.
+
+ -- William Luke <126307463+WillXLuke@users.noreply.github.com>  Sun, 08 Nov 2026 16:30:00 +0800

@@ -6,3 +6,9 @@ build/
 *.cmd
 modules.order
 Module.symvers
+debian/.debhelper/
+debian/files
+debian/debhelper-build-stamp
+debian/*.substvars
+debian/libva-v4l2-rk3399/
+debian/tmp/

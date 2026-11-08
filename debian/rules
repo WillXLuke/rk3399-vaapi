@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+# gcc-15 ICEs ("internal compiler error: Illegal instruction") on this board.
+export CC=gcc-14
+export CXX=g++-14
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	:
+
+override_dh_auto_build:
+	cd vaapi-driver && meson setup build --buildtype=release
+	cd vaapi-driver && ninja -C build
+
+override_dh_auto_test:
+	:
+
+override_dh_auto_install:
+	install -Dm755 vaapi-driver/build/src/v4l2_drv_video.so \
+		debian/libva-v4l2-rk3399/usr/lib/aarch64-linux-gnu/dri/v4l2_drv_video.so
+
+override_dh_auto_clean:
+	rm -rf vaapi-driver/build

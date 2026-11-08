@@ -1,0 +1,22 @@
+Source: libva-v4l2-rk3399
+Section: libs
+Priority: optional
+Maintainer: William Luke <126307463+WillXLuke@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), meson, ninja-build, pkg-config,
+ libva-dev, libdrm-dev, libudev-dev, gcc-14, g++-14
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/WillXLuke/rk3399-vaapi
+
+Package: libva-v4l2-rk3399
+Architecture: arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: VA-API driver for the Rockchip RK3399 video engine
+ libva-v4l2 backed by V4L2 memory-to-memory devices, with H.264 encode
+ through the VPU2 and H.264/HEVC/VP9 decode through RKVDU on the RK3399.
+ The encoder path also provides a VA video processor (VAProfileNone /
+ VAEntrypointVideoProc) that converts packed RGB frames to the NV12
+ surfaces the VPU2 takes.
+ .
+ Install the matching hantro-vpu-rk3399 kernel module package for the
+ encoder node to exist.
