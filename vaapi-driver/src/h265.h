@@ -44,9 +44,14 @@ class H265Context : public Context {
 public:
     static std::set<VAProfile> supported_profiles(const V4L2M2MDevice& device);
 
-    H265Context(DriverData* driver_data, V4L2M2MDevice& device, int picture_width, int picture_height,
-        std::span<VASurfaceID> surface_ids);
+    H265Context(DriverData* driver_data, V4L2M2MDevice& device, VAProfile profile, int picture_width,
+        int picture_height, std::span<VASurfaceID> surface_ids);
 
     VAStatus store_buffer(const Buffer& buffer) const override;
     int set_controls() override;
+    void prime_capture(const Surface& surface) override;
+
+private:
+    VAProfile profile;
+    void prime_sps(int width, int height, bool ten_bit);
 };

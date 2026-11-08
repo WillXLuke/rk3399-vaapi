@@ -38,6 +38,7 @@ extern "C" {
 #include "v4l2.h"
 
 struct DriverData;
+struct Surface;
 
 class Context {
 public:
@@ -46,11 +47,14 @@ public:
     static std::set<VAProfile> supported_profiles(const std::vector<V4L2M2MDevice>& devices);
 
     Context(DriverData* driver_data, V4L2M2MDevice& device, fourcc pixelformat, int picture_width, int picture_height,
-        std::span<VASurfaceID> surface_ids);
+        std::span<VASurfaceID> surface_ids, bool defer_surfaces = false);
     virtual ~Context();
 
     virtual VAStatus store_buffer(const Buffer& buffer) const = 0;
     virtual int set_controls() = 0;
+    // Program the device-level SPS that tells rkvdec which capture format to
+    // derive, before the capture queue is allocated.  H.265 overrides this.
+    virtual void prime_capture(const Surface& surface);
     virtual VAStatus encode(VASurfaceID surface_id) { return VA_STATUS_ERROR_UNIMPLEMENTED; }
 
     VASurfaceID render_surface_id;

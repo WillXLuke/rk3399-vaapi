@@ -72,9 +72,18 @@ VAStatus createSurfaces2(VADriverContextP context, unsigned int format, unsigned
 
     // RGB32 surfaces are host-only: a video-processing context fills them with
     // packed pixels and converts them to NV12, so no device has to back them.
-    if (format != VA_RT_FORMAT_RGB32
-        && std::ranges::none_of(
-            driver_data->devices, [&](auto&& d) { return matching_format(d, format) != formats.end(); })) {
+    bool backed = std::ranges::any_of(
+        driver_data->devices, [&](auto&& d) { return matching_format(d, format) != formats.end(); });
+    // The rkvdec context has not been created yet, so its current coded format
+    // is still the default (MPEG-2) and NV15 is not enumerated.  The HEVC
+    // context primes the 10-bit SPS before it asks for the capture format, so
+    // accept a 10-bit surface when an HEVC stateless decoder is present.
+    if (!backed && format == VA_RT_FORMAT_YUV420_10) {
+        backed = std::ranges::any_of(driver_data->devices, [](auto&& d) {
+            return d.format_supported(d.output_buf_type, V4L2_PIX_FMT_HEVC_SLICE);
+        });
+    }
+    if (format != VA_RT_FORMAT_RGB32 && !backed) {
         error_log(context, "No matching render target supported by device.\n");
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
@@ -192,6 +201,7 @@ VAStatus syncSurface(VADriverContextP context, VASurfaceID surface_id)
 VAStatus querySurfaceAttributes(
     VADriverContextP context, VAConfigID config, VASurfaceAttrib* attributes, unsigned int* attributes_count)
 {
+    auto driver_data = static_cast<DriverData*>(context->pDriverData);
     VASurfaceAttrib* attributes_list;
     unsigned int attributes_list_size = Config::max_attributes * sizeof(*attributes);
     int memory_types;
@@ -205,6 +215,17 @@ VAStatus querySurfaceAttributes(
     attributes_list[i].value.type = VAGenericValueTypeInteger;
     attributes_list[i].value.value.i = VA_FOURCC_NV12;
     i++;
+
+    bool main10 = false;
+    if (driver_data->configs.contains(config))
+        main10 = driver_data->configs.at(config).profile == VAProfileHEVCMain10;
+    if (main10) {
+        attributes_list[i].type = VASurfaceAttribPixelFormat;
+        attributes_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+        attributes_list[i].value.type = VAGenericValueTypeInteger;
+        attributes_list[i].value.value.i = VA_FOURCC_P010;
+        i++;
+    }
 
     attributes_list[i].type = VASurfaceAttribMinWidth;
     attributes_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
@@ -300,6 +321,12 @@ VAStatus exportSurfaceHandle(
     if (!surface.destination_buffer.has_value()) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+
+    // The capture buffer is packed NV15; a DRM PRIME export would have to
+    // describe it as P010, which is not the same memory layout.  Callers that
+    // need CPU frames use vaGetImage/vaDeriveImage, which unpack.
+    if (surface.format == VA_RT_FORMAT_YUV420_10)
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
 
     std::vector<int> export_fds;
     try {

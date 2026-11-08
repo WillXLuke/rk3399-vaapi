@@ -75,7 +75,8 @@ VAStatus createConfig(VADriverContextP context, VAProfile profile, VAEntrypoint 
         Config {
             .profile = profile,
             .entrypoint = entrypoint,
-            .attributes { { VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420 } },
+            .attributes { { VAConfigAttribRTFormat, profile == VAProfileHEVCMain10 ? VA_RT_FORMAT_YUV420_10
+                                                                                  : VA_RT_FORMAT_YUV420 } },
             .attributes_count = 1,
         }));
     if (!inserted) {
@@ -179,7 +180,7 @@ VAStatus getConfigAttributes(VADriverContextP context, VAProfile profile, VAEntr
     for (int i = 0; i < attributes_count; i++) {
         switch (attributes[i].type) {
         case VAConfigAttribRTFormat:
-            attributes[i].value = VA_RT_FORMAT_YUV420;
+            attributes[i].value = profile == VAProfileHEVCMain10 ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
             break;
         case VAConfigAttribRateControl:
             attributes[i].value = entrypoint == VAEntrypointEncSlice

@@ -97,7 +97,7 @@ Context* Context::create(DriverData* driver_data, VAProfile profile, VAEntrypoin
             return new MPEG2Context(driver_data, device, picture_width, picture_height, surface_ids);
         }
         if (H265Context::supported_profiles(device).contains(profile)) {
-            return new H265Context(driver_data, device, picture_width, picture_height, surface_ids);
+            return new H265Context(driver_data, device, profile, picture_width, picture_height, surface_ids);
         }
         if (H264Context::supported_profiles(device).contains(profile)) {
             return new H264Context(driver_data, device, profile, picture_width, picture_height, surface_ids);
@@ -116,7 +116,7 @@ Context* Context::create(DriverData* driver_data, VAProfile profile, VAEntrypoin
 }
 
 Context::Context(DriverData* driver_data, V4L2M2MDevice& dev, fourcc pixelformat, int picture_width, int picture_height,
-    std::span<VASurfaceID> surface_ids)
+    std::span<VASurfaceID> surface_ids, bool defer_surfaces)
     : render_surface_id(VA_INVALID_ID)
     , picture_width(picture_width)
     , picture_height(picture_height)
@@ -126,8 +126,9 @@ Context::Context(DriverData* driver_data, V4L2M2MDevice& dev, fourcc pixelformat
     device.set_format(device.output_buf_type, pixelformat, picture_width, picture_height);
 
     // Applications such as FFmpeg create the VA context before the surfaces.
-    // Defer the capture setup until the first picture in that case.
-    if (!surface_ids.empty())
+    // Defer the capture setup until the first picture in that case.  HEVC also
+    // defers so it can prime the SPS at the right bit depth first.
+    if (!defer_surfaces && !surface_ids.empty())
         initialize_surfaces(surface_ids);
 }
 
@@ -138,26 +139,16 @@ void Context::initialize_surfaces(std::span<VASurfaceID> surface_ids)
     if (surface_ids.empty())
         throw std::invalid_argument("No surfaces to be created");
 
-    num_buffers = std::max<unsigned>(surface_ids.size(), 32);
+    // Applications create surfaces lazily, so the initial span can be smaller
+    // than the pool they eventually bind.  FFmpeg's HEVC decoder ends up with
+    // 20 surfaces for a 4:2:0 stream; keep a little headroom above that.
+    num_buffers = std::max<unsigned>(surface_ids.size(), 24);
 
     /* The Rockchip driver initializes its internal image format from the
      * current SPS control and refuses to change it once buffers are
-     * allocated. Set a matching 4:2:0 8-bit SPS before requesting the
-     * capture buffers, so that per-request SPS controls are accepted. */
-    {
-        const auto& s = driver_data->surfaces.at(surface_ids[0]);
-        v4l2_ctrl_h264_sps sps = {};
-        sps.chroma_format_idc = 1;
-        sps.pic_width_in_mbs_minus1 = (s.width + 15) / 16 - 1;
-        sps.pic_height_in_map_units_minus1 = (s.height + 15) / 16 - 1;
-        sps.flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY;
-        v4l2_ext_control ctrl = {
-            .id = V4L2_CID_STATELESS_H264_SPS,
-            .size = sizeof(sps),
-            .ptr = &sps,
-        };
-        device.set_ext_controls(-1, std::span(&ctrl, 1));
-    }
+     * allocated. Set a matching SPS before requesting the capture buffers,
+     * so that per-request SPS controls are accepted. */
+    prime_capture(driver_data->surfaces.at(surface_ids[0]));
 
     unsigned capture_count = createSurfacesDeferred(driver_data, *this, surface_ids, num_buffers);
     unsigned output_count = device.request_buffers(device.output_buf_type, num_buffers);
@@ -168,6 +159,21 @@ void Context::initialize_surfaces(std::span<VASurfaceID> surface_ids)
 
     device.set_streaming(true);
     surfaces_initialized = true;
+}
+
+void Context::prime_capture(const Surface& surface)
+{
+    v4l2_ctrl_h264_sps sps = {};
+    sps.chroma_format_idc = 1;
+    sps.pic_width_in_mbs_minus1 = (surface.width + 15) / 16 - 1;
+    sps.pic_height_in_map_units_minus1 = (surface.height + 15) / 16 - 1;
+    sps.flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY;
+    v4l2_ext_control ctrl = {
+        .id = V4L2_CID_STATELESS_H264_SPS,
+        .size = sizeof(sps),
+        .ptr = &sps,
+    };
+    device.set_ext_controls(-1, std::span(&ctrl, 1));
 }
 
 void Context::bind_surface(VASurfaceID surface_id)

@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <va/va.h>
@@ -46,6 +47,77 @@ extern "C" {
 
 namespace {
 
+// rkvdec's NV15 packs four 10-bit components into five bytes:
+//   b0 = c0[7:0]
+//   b1 = c1[5:0] << 2 | c0[9:8]
+//   b2 = c2[3:0] << 4 | c1[9:6]
+//   b3 = c3[1:0] << 6 | c2[9:4]
+//   b4 = c3[9:2]
+void unpack_nv15_row(const uint8_t* src, uint16_t* dst, unsigned count)
+{
+    unsigned x = 0;
+    for (; x + 4 <= count; x += 4) {
+        // Four 10-bit samples are one little-endian 40-bit word.  Reading a
+        // full 64-bit word is safe: the capture buffer carries the colmv
+        // plane after the pixels, and a row is followed by another row.
+        uint64_t word;
+        memcpy(&word, src, sizeof(word));
+        dst[x + 0] = static_cast<uint16_t>(((word >> 0) & 0x3ff) << 6);
+        dst[x + 1] = static_cast<uint16_t>(((word >> 10) & 0x3ff) << 6);
+        dst[x + 2] = static_cast<uint16_t>(((word >> 20) & 0x3ff) << 6);
+        dst[x + 3] = static_cast<uint16_t>(((word >> 30) & 0x3ff) << 6);
+        src += 5;
+    }
+    for (; x < count; x++) {
+        const unsigned bit = x * 10;
+        const unsigned byte = bit / 8;
+        const unsigned shift = bit % 8;
+        const uint32_t word = static_cast<uint32_t>(src[byte]) | (static_cast<uint32_t>(src[byte + 1]) << 8)
+            | (static_cast<uint32_t>(src[byte + 2]) << 16);
+        dst[x] = static_cast<uint16_t>(((word >> shift) & 0x3ff) << 6);
+    }
+}
+
+// P010 stores 10 bits in the high bits of a 16-bit container.  The VA image
+// the client asked for is P010; the V4L2 capture buffer is packed NV15.
+VAStatus copy_nv15_to_p010(DriverData* driver_data, const Surface& surface, VAImage* image)
+{
+    if (!driver_data->buffers.contains(image->buf))
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!surface.destination_buffer.has_value())
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+
+    auto& buffer = driver_data->buffers.at(image->buf);
+    const auto& mapping = surface.destination_buffer->get().mapping();
+    if (mapping.empty())
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+
+    const unsigned width = surface.width;
+    const unsigned height = surface.height;
+    if (image->width != width || image->height != height || image->num_planes != 2)
+        return VA_STATUS_ERROR_INVALID_IMAGE_FORMAT;
+
+    const size_t row_stride = (static_cast<size_t>(width) * 10 + 7) / 8;
+    const size_t y_size = row_stride * height;
+    const size_t chroma_size = row_stride * (height / 2);
+    if (mapping[0].size() < y_size + chroma_size)
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+
+    const uint8_t* src = mapping[0].data();
+    uint8_t* dst = buffer.data.get();
+    uint8_t* dst_y = dst + image->offsets[0];
+    uint8_t* dst_uv = dst + image->offsets[1];
+
+    for (unsigned y = 0; y < height; y++)
+        unpack_nv15_row(src + static_cast<size_t>(y) * row_stride,
+            reinterpret_cast<uint16_t*>(dst_y + static_cast<size_t>(y) * image->pitches[0]), width);
+    for (unsigned y = 0; y < height / 2; y++)
+        unpack_nv15_row(src + y_size + static_cast<size_t>(y) * row_stride,
+            reinterpret_cast<uint16_t*>(dst_uv + static_cast<size_t>(y) * image->pitches[1]), width);
+
+    return VA_STATUS_SUCCESS;
+}
+
 VAStatus copy_surface_to_image(DriverData* driver_data, const Surface& surface, VAImage* image)
 {
     unsigned int i;
@@ -54,6 +126,9 @@ VAStatus copy_surface_to_image(DriverData* driver_data, const Surface& surface, 
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
     auto& buffer = driver_data->buffers.at(image->buf);
+
+    if (image->format.fourcc == VA_FOURCC_P010)
+        return copy_nv15_to_p010(driver_data, surface, image);
 
     assert(image->num_planes == surface.logical_destination_layout.size());
     for (i = 0; i < surface.logical_destination_layout.size(); i++) {
@@ -221,7 +296,7 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
             return status;
     }
 
-    format.fourcc = VA_FOURCC_NV12;
+    format.fourcc = surface.format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 
     status = createImage(context, &format, surface.width, surface.height, image);
     if (status != VA_STATUS_SUCCESS)
@@ -246,7 +321,8 @@ VAStatus queryImageFormats(VADriverContextP context, VAImageFormat* formats, int
     formats[0].fourcc = VA_FOURCC_NV12;
     formats[1].fourcc = VA_FOURCC_RGBA;
     formats[2].fourcc = VA_FOURCC_BGRA;
-    *formats_count = 3;
+    formats[3].fourcc = VA_FOURCC_P010;
+    *formats_count = 4;
 
     return VA_STATUS_SUCCESS;
 }

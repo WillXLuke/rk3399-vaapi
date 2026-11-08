@@ -35,6 +35,10 @@ extern "C" {
 #include <va/va.h>
 }
 
+#ifndef V4L2_PIX_FMT_NV15
+#define V4L2_PIX_FMT_NV15 v4l2_fourcc('N', 'V', '1', '5')
+#endif
+
 namespace {
 
 BufferLayout nv12_derive_layout(unsigned width, unsigned height)
@@ -46,13 +50,30 @@ BufferLayout nv12_derive_layout(unsigned width, unsigned height)
     };
 }
 
+// rkvdec writes packed NV15 (10 bits per component, four components in five
+// bytes).  VA-API clients expect P010 (16-bit container, 10 significant high
+// bits), so the logical layout is P010 even though the V4L2 buffer is NV15.
+// copy_surface_to_image() performs the unpack.
+BufferLayout p010_derive_layout(unsigned width, unsigned height)
+{
+    auto y_size = width * height * 2;
+    return BufferLayout {
+        { 0, y_size, width * 2, 0 },
+        { 0, width * height, width * 2, y_size },
+    };
+}
+
 } // namespace
 
-const std::array<Format, 2> formats = {
+const std::array<Format, 4> formats = {
     Format { { V4L2_PIX_FMT_NV12, &nv12_derive_layout }, { VA_FOURCC_NV12, VA_RT_FORMAT_YUV420 },
         { DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR } },
     Format { { V4L2_PIX_FMT_NV12M, nullptr }, { VA_FOURCC_NV12, VA_RT_FORMAT_YUV420 },
         { DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR } },
+    Format { { V4L2_PIX_FMT_NV15, &p010_derive_layout }, { VA_FOURCC_P010, VA_RT_FORMAT_YUV420_10 },
+        { DRM_FORMAT_P010, DRM_FORMAT_MOD_LINEAR } },
+    Format { { V4L2_PIX_FMT_P010, &p010_derive_layout }, { VA_FOURCC_P010, VA_RT_FORMAT_YUV420_10 },
+        { DRM_FORMAT_P010, DRM_FORMAT_MOD_LINEAR } },
 };
 
 const Format& lookup_format(fourcc v4l2_fourcc)

@@ -155,22 +155,11 @@ void fill_pps(const VAPictureParameterBufferHEVC* picture, v4l2_ctrl_hevc_pps* p
                 : 0);
 }
 
-// One entry per reference picture that made it into the DPB array, so the
-// slice's reference lists, which VA gives as surface IDs, can be rewritten as
-// indices into that array as V4L2 expects.
+// Number of entries added to the V4L2 DPB, in the same order as the VA
+// ReferenceFrames[] array.  VA slice RefPicList[] entries index that array
+// directly.
 struct RefMap {
-    VASurfaceID id[kMaxDpb];
-    unsigned index[kMaxDpb];
     unsigned count = 0;
-
-    unsigned find(VASurfaceID surface_id) const
-    {
-        for (unsigned i = 0; i < count; i++) {
-            if (id[i] == surface_id)
-                return index[i];
-        }
-        return 0;
-    }
 };
 
 void fill_decode_params(
@@ -212,8 +201,6 @@ void fill_decode_params(
             .reserved = 0,
             .pic_order_cnt_val = ref.pic_order_cnt,
         };
-        refs.id[refs.count] = ref.picture_id;
-        refs.index[refs.count] = index;
         refs.count++;
 
         if ((ref.flags & VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) && num_st_before < kMaxDpb)
@@ -247,6 +234,11 @@ void fill_slice_params(const Surface& surface, const VAPictureParameterBufferHEV
     // the start code we added in front of it.
     params->bit_size = 0;
     params->num_entry_point_offsets = slice->num_entry_point_offsets;
+    // VA reports the number of bits the inline short_term_ref_pic_set() takes
+    // in this slice header (0 when the slice uses an SPS RPS). rkvdec needs it
+    // as the bit offset to the slice data, otherwise it decodes the RPS bits as
+    // slice data and the job errors on the first P frame.
+    params->short_term_ref_pic_set_size = static_cast<uint16_t>(picture->st_rps_bits);
     params->data_byte_offset = static_cast<uint32_t>(slice->slice_data_offset + slice->slice_data_byte_offset);
     params->nal_unit_type = static_cast<uint8_t>(nal_unit_type(data));
     params->nuh_temporal_id_plus1 = static_cast<uint8_t>(nuh_temporal_id_plus1(data));
@@ -287,13 +279,22 @@ void fill_slice_params(const Surface& surface, const VAPictureParameterBufferHEV
                 ? V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT
                 : 0);
 
+    // VASliceParameterBufferHEVC::RefPicList[] entries are indices into the
+    // picture's ReferenceFrames[], and fill_decode_params() puts those same
+    // entries into the V4L2 DPB in order, so the index maps straight through.
+    // Treating them as surface IDs (as an earlier revision did) silently
+    // rewrote every list to DPB 0.
     const unsigned count_l0 = slice->num_ref_idx_l0_active_minus1 + 1;
-    for (unsigned i = 0; i < count_l0 && i < kMaxDpb; i++)
-        params->ref_idx_l0[i] = static_cast<uint8_t>(refs.find(slice->RefPicList[0][i]));
+    for (unsigned i = 0; i < count_l0 && i < kMaxDpb; i++) {
+        const unsigned ref = slice->RefPicList[0][i];
+        params->ref_idx_l0[i] = static_cast<uint8_t>(ref < refs.count ? ref : 0xff);
+    }
 
     const unsigned count_l1 = slice->num_ref_idx_l1_active_minus1 + 1;
-    for (unsigned i = 0; i < count_l1 && i < kMaxDpb; i++)
-        params->ref_idx_l1[i] = static_cast<uint8_t>(refs.find(slice->RefPicList[1][i]));
+    for (unsigned i = 0; i < count_l1 && i < kMaxDpb; i++) {
+        const unsigned ref = slice->RefPicList[1][i];
+        params->ref_idx_l1[i] = static_cast<uint8_t>(ref < refs.count ? ref : 0xff);
+    }
 
     params->pred_weight_table.luma_log2_weight_denom = slice->luma_log2_weight_denom;
     params->pred_weight_table.delta_chroma_log2_weight_denom = slice->delta_chroma_log2_weight_denom;
@@ -313,9 +314,10 @@ void fill_slice_params(const Surface& surface, const VAPictureParameterBufferHEV
 
 } // namespace
 
-H265Context::H265Context(DriverData* driver_data, V4L2M2MDevice& device, int picture_width, int picture_height,
-    std::span<VASurfaceID> surface_ids)
-    : Context(driver_data, device, V4L2_PIX_FMT_HEVC_SLICE, picture_width, picture_height, surface_ids)
+H265Context::H265Context(DriverData* driver_data, V4L2M2MDevice& device, VAProfile profile, int picture_width,
+    int picture_height, std::span<VASurfaceID> surface_ids)
+    : Context(driver_data, device, V4L2_PIX_FMT_HEVC_SLICE, picture_width, picture_height, surface_ids, true)
+    , profile(profile)
 {
     // Device-level controls: rkvdec only does frame-based Annex B, but say so
     // explicitly instead of relying on the default.
@@ -325,24 +327,28 @@ H265Context::H265Context(DriverData* driver_data, V4L2M2MDevice& device, int pic
         { .id = V4L2_CID_STATELESS_HEVC_DECODE_MODE, .size = sizeof(decode_mode), .ptr = &decode_mode },
         { .id = V4L2_CID_STATELESS_HEVC_START_CODE, .size = sizeof(start_code), .ptr = &start_code },
     };
-    // The device's defaults are already frame-based Annex B; setting them is
-    // best effort because the menu is a single value the kernel sometimes
-    // refuses to write back.
     try {
         device.set_ext_controls(-1, std::span(controls, 2));
     } catch (std::runtime_error&) {
     }
 
+    prime_sps(picture_width, picture_height, profile == VAProfileHEVCMain10);
+    if (!surface_ids.empty())
+        initialize_surfaces(surface_ids);
+}
+
+void H265Context::prime_sps(int width, int height, bool ten_bit)
+{
     // rkvdec derives its capture format from the SPS when that control is
-    // applied, and refuses with -EBUSY once the capture queue is busy. Prime
-    // it here, before any buffer exists, with the format this context uses;
-    // the per-request SPS then matches and never triggers a reset.
+    // applied, and refuses with -EBUSY once the capture queue is busy. Priming
+    // it here, before any buffer exists, with the format this context uses
+    // makes the per-request SPS match and never triggers a reset.
     v4l2_ctrl_hevc_sps priming = {};
     priming.chroma_format_idc = 1;
-    priming.bit_depth_luma_minus8 = 0;
-    priming.bit_depth_chroma_minus8 = 0;
-    priming.pic_width_in_luma_samples = static_cast<uint16_t>(picture_width);
-    priming.pic_height_in_luma_samples = static_cast<uint16_t>(picture_height);
+    priming.bit_depth_luma_minus8 = ten_bit ? 2 : 0;
+    priming.bit_depth_chroma_minus8 = ten_bit ? 2 : 0;
+    priming.pic_width_in_luma_samples = static_cast<uint16_t>(width);
+    priming.pic_height_in_luma_samples = static_cast<uint16_t>(height);
     v4l2_ext_control prime = {
         .id = V4L2_CID_STATELESS_HEVC_SPS,
         .size = sizeof(priming),
@@ -353,6 +359,12 @@ H265Context::H265Context(DriverData* driver_data, V4L2M2MDevice& device, int pic
     } catch (std::runtime_error& e) {
         fprintf(stderr, "[h265] priming sps: %s\n", e.what());
     }
+}
+
+void H265Context::prime_capture(const Surface& surface)
+{
+    prime_sps(surface.width, surface.height,
+        profile == VAProfileHEVCMain10 || surface.format == VA_RT_FORMAT_YUV420_10);
 }
 
 VAStatus H265Context::store_buffer(const Buffer& buffer) const
@@ -466,10 +478,13 @@ int H265Context::set_controls()
 
 std::set<VAProfile> H265Context::supported_profiles(const V4L2M2MDevice& device)
 {
-    // Experimental, not advertised yet: the stateless controls now reach
-    // rkvdec (the SPS has to be primed before the capture queue is busy, or
-    // request setup fails with -EBUSY), but the hardware job still ends in an
-    // error, so exposing the profile would only make clients fail on it.
-    (void)device;
-    return std::set<VAProfile>();
+    std::set<VAProfile> profiles;
+    if (!device.format_supported(device.output_buf_type, V4L2_PIX_FMT_HEVC_SLICE))
+        return profiles;
+
+    profiles.insert(VAProfileHEVCMain);
+    // rkvdec 10-bit output is packed NV15; the driver exposes it as P010 and
+    // unpacks it in vaGetImage/vaDeriveImage.
+    profiles.insert(VAProfileHEVCMain10);
+    return profiles;
 }

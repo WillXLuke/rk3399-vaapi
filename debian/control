@@ -13,10 +13,11 @@ Architecture: arm64
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: VA-API driver for the Rockchip RK3399 video engine
  libva-v4l2 backed by V4L2 memory-to-memory devices, with H.264 encode
- through the VPU2 and H.264/HEVC/VP9 decode through RKVDU on the RK3399.
- The encoder path also provides a VA video processor (VAProfileNone /
- VAEntrypointVideoProc) that converts packed RGB frames to the NV12
- surfaces the VPU2 takes.
+ through the VPU2 and H.264/HEVC Main/Main10 decode through RKVDU on the
+ RK3399.  Main10 surfaces are P010, unpacked from rkvdec's packed NV15
+ capture buffers.  The encoder path also provides a VA video processor
+ (VAProfileNone / VAEntrypointVideoProc) that converts packed RGB frames
+ to the NV12 surfaces the VPU2 takes.
  .
  Install the matching hantro-vpu-rk3399 kernel module package for the
  encoder node to exist.

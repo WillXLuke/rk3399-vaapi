@@ -382,7 +382,10 @@ void V4L2M2MDevice::set_format(v4l2_buf_type type, unsigned int pixelformat, uns
         if (pixelformat == V4L2_PIX_FMT_H264 || pixelformat == V4L2_PIX_FMT_H264_SLICE) {
             format->fmt.pix_mp.plane_fmt[0].sizeimage = SOURCE_SIZE_MAX;
         } else {
-            format->fmt.pix_mp.plane_fmt[0].sizeimage = width * height;
+            // One compressed frame, not one raw frame.  4 MiB covers 4K60 at
+            // any sane bitrate and halves the 4K buffer footprint.
+            format->fmt.pix_mp.plane_fmt[0].sizeimage
+                = std::min<unsigned>(width * height, 4U * 1024 * 1024);
             if (format->fmt.pix_mp.num_planes > 1)
                 format->fmt.pix_mp.plane_fmt[1].sizeimage = width * height / 4;
             if (format->fmt.pix_mp.num_planes > 2)

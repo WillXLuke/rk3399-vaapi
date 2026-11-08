@@ -53,5 +53,5 @@ struct Format {
     } drm;
 };
 
-extern const std::array<Format, 2> formats;
+extern const std::array<Format, 4> formats;
 const Format& lookup_format(fourcc v4l2_fourcc);

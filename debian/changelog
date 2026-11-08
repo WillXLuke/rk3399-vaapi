@@ -1,3 +1,21 @@
+libva-v4l2-rk3399 (1.0.3-1) unstable; urgency=medium
+
+  * HEVC Main and Main10 decode exposed through VA-API: map the VA picture
+    and slice buffers to the modern stateless V4L2 controls, fill the DPB
+    with capture-buffer timestamps, translate VA RefPicList[] (indices into
+    ReferenceFrames[]) to V4L2 DPB indices, and pass the inline short-term
+    RPS bit offset so rkvdec does not decode RPS bits as slice data.
+  * Main10: expose P010 surfaces, negotiate them with FFmpeg, and unpack
+    rkvdec's packed NV15 capture buffers in vaGetImage/vaDeriveImage.
+    vaExportSurfaceHandle remains unimplemented for 10-bit.
+  * Reduce the 4K buffer footprint (24 capture buffers, 4 MiB compressed
+    frame buffers) and keep profile-aware SPS priming before REQBUFS.
+  * Validation: 1950 frames of 3840x2160@59.94 Main10 (32.53 s) at 62.4 fps
+    end-to-end with the performance governor (57.7-60.5 on ondemand); 390-frame
+    P010 output bit-exact against software decode.
+
+ -- William Luke <126307463+WillXLuke@users.noreply.github.com>  Sun, 08 Nov 2026 19:30:00 +0800
+
 libva-v4l2-rk3399 (1.0.2-1) unstable; urgency=medium
 
   * Performance: upload RGB frames straight into the surface (derived image
