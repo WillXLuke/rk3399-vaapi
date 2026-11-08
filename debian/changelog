@@ -1,3 +1,12 @@
+libva-v4l2-rk3399 (1.0.2-1) unstable; urgency=medium
+
+  * Performance: upload RGB frames straight into the surface (derived image
+    aliases the surface memory, removing an 8 MB copy per frame), and split the
+    NV12 chroma planes with NEON. 1080p capture+encode went from ~21 to
+    ~26 fps at 42 ms/frame on the same content.
+
+ -- William Luke <126307463+WillXLuke@users.noreply.github.com>  Sun, 08 Nov 2026 18:10:00 +0800
+
 libva-v4l2-rk3399 (1.0.1-1) unstable; urgency=medium
 
   * Validation pass: 4K H.264/HEVC decode, 1080p VP8/MPEG-2 decode, 1080p30

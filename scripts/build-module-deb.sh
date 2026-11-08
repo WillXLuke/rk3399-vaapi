@@ -7,7 +7,7 @@ set -eu
 
 [ $# -ge 2 ] || { echo "usage: $0 <hantro-vpu.ko> <rockchip-vdec.ko> [output-dir]" >&2; exit 1; }
 OUT=${3:-.}
-VER=1.0.1
+VER=1.0.2
 KVER=$(modinfo -F vermagic "$1" | awk '{print $1}')
 PKG=rk3399-vpu-modules-${KVER}
 STAGE=$(mktemp -d)

@@ -146,6 +146,7 @@ encoded through this VA-API driver with FFmpeg:
 | Decode | JPEG | up to 8176x8176 | no decoder driver in mainline |
 | Decode | MPEG-4, VC-1 | 1080p | no driver in mainline |
 | Encode | H.264 High | 1920x1080, 600 frames | 40 fps sustained (~26 Mbps at QP floor) |
+| Encode | H.264, Selkies path | 1920x1080, live content | 26 fps (was 21 before 1.0.2) |
 | Encode | JPEG | 8176x8176 | 2.7 MB image, works |
 | Encode | VP8 | 1080p | no VP8 encoder in the VPU2 driver |
 
